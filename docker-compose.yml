@@ -1,0 +1,54 @@
+services:
+  pyscenedetect:
+    image: python:3.11-slim
+    container_name: pyscenedetect-lab
+    working_dir: /work
+    volumes:
+      - .:/work
+      - ./input:/input
+      - ./output:/output
+    tty: true
+    stdin_open: true
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /work/requirements.txt &&
+        python /work/scripts/detect_ads.py $${DETECT_ARGS:-}
+      "
+
+  cut_ads:
+    image: python:3.11-slim
+    working_dir: /work
+    volumes:
+      - .:/work
+      - ./input:/input
+      - ./output:/output
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /work/requirements.txt &&
+        python /work/scripts/cut_ads.py $${CUT_ARGS:-}
+      "
+
+  review_ads:
+    image: python:3.11-slim
+    working_dir: /work
+    volumes:
+      - .:/work
+      - ./output:/output
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /work/requirements.txt &&
+        python /work/scripts/review_ads.py $${REVIEW_ARGS:-}
+      "
+
+  build_review:
+    image: python:3.11-slim
+    working_dir: /work
+    volumes:
+      - .:/work
+      - ./input:/input
+      - ./output:/output
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /work/requirements.txt &&
+        python /work/scripts/build_review.py $${BUILD_REVIEW_ARGS:-}
+      "
