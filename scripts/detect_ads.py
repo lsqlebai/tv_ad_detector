@@ -56,6 +56,21 @@ def safe_time_name(seconds: float) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "-", format_time(seconds)).strip("-")
 
 
+def cv_imread(path: Path, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
+def cv_imwrite(path: Path, image: np.ndarray) -> bool:
+    success, encoded = cv2.imencode(path.suffix, image)
+    if not success:
+        return False
+    encoded.tofile(str(path))
+    return True
+
+
 def parse_keypoints(path: Path) -> list[Keypoint]:
     if not path.exists() or path.is_dir():
         return []
@@ -622,13 +637,13 @@ def extract_snapshots(
             str(raw_path),
         ]
         subprocess.run(command, check=True)
-        frame = cv2.imread(str(raw_path))
+        frame = cv_imread(raw_path)
         raw_path.unlink(missing_ok=True)
         if frame is None:
             continue
 
         display = overlay_label(frame, f"ad {detection_index} {label} {format_time(target_time)}")
-        cv2.imwrite(str(path), display)
+        cv_imwrite(path, display)
         report_path = path.relative_to(output_dir.parent)
         snapshots.setdefault(detection_index, {})[label] = report_path.as_posix()
         contact_frames.append(cv2.resize(display, (320, 180), interpolation=cv2.INTER_AREA))
@@ -642,7 +657,7 @@ def extract_snapshots(
             while len(row) < columns:
                 row.append(blank)
             rows.append(np.hstack(row))
-        cv2.imwrite(str(output_dir / f"{video_path.stem}.ads.keyframes.jpg"), np.vstack(rows))
+        cv_imwrite(output_dir / f"{video_path.stem}.ads.keyframes.jpg", np.vstack(rows))
 
     return snapshots
 

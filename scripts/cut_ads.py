@@ -216,7 +216,7 @@ def process_video(
         ads = review_ranges.get(video_path.name, [])
         source = "review workbook"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{video_path.stem}.clean.mp4"
+    output_path = output_dir / video_path.name
 
     if not ads:
         print(f"{video_path.name}: no ads in {source}, skipping")
