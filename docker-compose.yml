@@ -1,6 +1,25 @@
+x-app-build: &app-build
+  context: "${APP_REPO:-https://github.com/lsqlebai/tv_ad_detector.git#main}"
+  dockerfile_inline: |
+    FROM python:3.11-slim
+
+    WORKDIR /work
+
+    ENV PYTHONDONTWRITEBYTECODE=1
+    ENV PYTHONUNBUFFERED=1
+
+    COPY requirements.txt /work/requirements.txt
+    RUN pip install --no-cache-dir -r /work/requirements.txt
+
+    COPY . /work
+
+    EXPOSE 8787
+
+    CMD ["python", "scripts/web_app.py", "--host", "0.0.0.0", "--port", "8787"]
+
 services:
   web:
-    build: .
+    build: *app-build
     container_name: tv-ad-detector
     working_dir: /work
     restart: unless-stopped
@@ -9,26 +28,23 @@ services:
     volumes:
       - ./input:/work/input
       - ./output:/work/output
-      - ./ad_templates:/work/ad_templates
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
 
   build_review:
     profiles: ["tools"]
-    build: .
+    build: *app-build
     working_dir: /work
     volumes:
       - ./input:/work/input
       - ./output:/work/output
-      - ./ad_templates:/work/ad_templates
     command: python scripts/build_review.py
 
   cut_ads:
     profiles: ["tools"]
-    build: .
+    build: *app-build
     working_dir: /work
     volumes:
       - ./input:/work/input
       - ./output:/work/output
-      - ./ad_templates:/work/ad_templates
     command: python scripts/cut_ads.py

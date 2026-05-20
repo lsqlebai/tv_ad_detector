@@ -207,6 +207,8 @@ python scripts/cut_ads.py --padding 0.3
 
 默认 `docker-compose.yml` 会启动一个常驻 Web 控制台，适合放在群晖 Container Manager 里长期运行。
 
+`docker-compose.yml` 是自包含的：它会在构建镜像时从 GitHub 拉取项目代码、脚本和 `ad_templates/` 模板库，并在 compose 文件里内嵌构建步骤。群晖上只需要放这个 compose 文件，以及持久化的 `input/`、`output/` 目录，不需要额外上传 Dockerfile、scripts 或 ad templates。
+
 ### 启动 Web 控制台
 
 ```bash
@@ -225,6 +227,12 @@ http://NAS_IP:8787
 WEB_PORT=18878 docker compose up -d --build
 ```
 
+如果要构建其它分支或自己的 fork，可以指定：
+
+```bash
+APP_REPO=https://github.com/lsqlebai/tv_ad_detector.git#main docker compose up -d --build
+```
+
 Web 页面提供：
 
 - 查看并选择 `input/` 下的视频
@@ -240,7 +248,6 @@ Web 页面提供：
 ```text
 input/          放原始视频
 output/         审核表和裁剪结果
-ad_templates/   广告模板库
 ```
 
 ### 命令行工具
