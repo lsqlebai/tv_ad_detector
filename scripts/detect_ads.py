@@ -175,6 +175,107 @@ def sample_video(video_path: Path, sample_rate: float) -> tuple[np.ndarray, np.n
     return np.asarray(times, dtype=np.float32), np.vstack(features), np.vstack(metrics), duration
 
 
+def boundary_frames(
+    video_path: Path,
+    start: float,
+    end: float,
+    sample_rate: float,
+) -> list[tuple[float, float, float, float]]:
+    start = max(0.0, start)
+    end = max(start, end)
+    reader = imageio_ffmpeg.read_frames(
+        str(video_path),
+        pix_fmt="rgb24",
+        output_params=["-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-vf", f"fps={sample_rate},scale=320:-2"],
+    )
+    try:
+        meta = next(reader)
+    except StopIteration:
+        return []
+
+    width, height = meta["size"]
+    rows: list[tuple[float, float, float, float]] = []
+    previous_gray: Optional[np.ndarray] = None
+    for frame_index, frame_bytes in enumerate(reader):
+        time_value = start + frame_index / sample_rate
+        rgb = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        brightness = float(gray.mean() / 255.0)
+        dark_ratio = float(np.mean(gray < 24))
+        diff = 0.0
+        if previous_gray is not None:
+            diff = float(np.mean(cv2.absdiff(gray, previous_gray)) / 255.0)
+        rows.append((time_value, brightness, dark_ratio, diff))
+        previous_gray = gray
+    return rows
+
+
+def strongest_cut_time(rows: list[tuple[float, float, float, float]], center: float, radius: float) -> Optional[float]:
+    candidates = [row for row in rows if abs(row[0] - center) <= radius]
+    if not candidates:
+        return None
+    time_value, _, _, diff = max(candidates, key=lambda row: row[3])
+    if diff < 0.14:
+        return None
+    return time_value
+
+
+def dark_transition_end(rows: list[tuple[float, float, float, float]], center: float, sample_rate: float) -> Optional[float]:
+    dark_times = [time_value for time_value, brightness, dark_ratio, _ in rows if time_value >= center - 1.0 and brightness < 0.16 and dark_ratio > 0.65]
+    if not dark_times:
+        return None
+    return max(dark_times) + 1.0 / sample_rate
+
+
+def trailing_cut_time(
+    rows: list[tuple[float, float, float, float]],
+    center: float,
+    radius: float,
+    sample_rate: float,
+) -> Optional[float]:
+    candidates = [row for row in rows if center - 0.25 <= row[0] <= center + radius and row[3] >= 0.14]
+    if not candidates:
+        return None
+    max_diff = max(row[3] for row in candidates)
+    strong = [row for row in candidates if row[3] >= max(0.14, max_diff * 0.72)]
+    return max(row[0] for row in strong) + 1.0 / sample_rate
+
+
+def refine_detection_boundaries(
+    video_path: Path,
+    detections: list[dict],
+    duration: float,
+    sample_rate: float = 8.0,
+    radius: float = 2.5,
+) -> list[dict]:
+    refined: list[dict] = []
+    for item in detections:
+        result = item.copy()
+        if item["kind"] not in {"template_match", "template_library"} or float(item["end"]) <= float(item["start"]):
+            refined.append(result)
+            continue
+
+        start = float(item["start"])
+        end = float(item["end"])
+        start_rows = boundary_frames(video_path, start - radius, start + radius, sample_rate)
+        end_rows = boundary_frames(video_path, end - radius, end + radius, sample_rate)
+
+        refined_start = strongest_cut_time(start_rows, start, radius=1.5)
+        refined_end = trailing_cut_time(end_rows, end, radius=1.5, sample_rate=sample_rate) or dark_transition_end(end_rows, end, sample_rate) or strongest_cut_time(end_rows, end, radius=1.5)
+
+        notes = []
+        if refined_start is not None and abs(refined_start - start) <= radius:
+            result["start"] = max(0.0, min(duration, refined_start))
+            notes.append(f"start_refined={start:.3f}->{result['start']:.3f}")
+        if refined_end is not None and abs(refined_end - end) <= radius:
+            result["end"] = max(float(result["start"]), min(duration, refined_end))
+            notes.append(f"end_refined={end:.3f}->{result['end']:.3f}")
+        if notes:
+            result["sources"] = sorted(set(result["sources"]) | set(notes))
+        refined.append(result)
+    return refined
+
+
 def cosine_window_scores(features: np.ndarray, template: np.ndarray) -> np.ndarray:
     window = len(template)
     if window > len(features):
@@ -548,6 +649,9 @@ def combine_detections(detections: list[dict], merge_gap: float) -> list[dict]:
             if item_priority < existing_priority:
                 existing.update(item)
             elif item_priority > existing_priority:
+                if existing["kind"] in {"template_match", "template_library"} and item["kind"] == "auto_discovery":
+                    existing["start"] = min(float(existing["start"]), start)
+                    existing["end"] = max(float(existing["end"]), end)
                 existing["score"] = max(float(existing["score"]), float(item["score"]))
                 existing["sources"] = sorted(set(existing["sources"]) | set(item["sources"]))
             else:
@@ -753,6 +857,7 @@ def main() -> int:
     parser.add_argument("--max-auto-candidates", type=int, default=8, help="Maximum automatic candidates per video.")
     parser.add_argument("--min-gap", type=float, default=8.0, help="Minimum seconds between detections.")
     parser.add_argument("--no-auto-discover", action="store_true", help="Disable automatic ad discovery.")
+    parser.add_argument("--no-refine-boundaries", action="store_true", help="Disable high-rate scene-cut and dark-frame boundary refinement.")
     parser.add_argument("--write-debug-files", action="store_true", help="Also write *.ads.txt, *.candidates.txt, *.ads.json, and keyframe contact sheets.")
     args = parser.parse_args()
     template_dir = args.template_dir
@@ -798,6 +903,8 @@ def main() -> int:
                 )
             )
         detections = combine_detections(detections, merge_gap=args.min_gap)
+        if not args.no_refine_boundaries:
+            detections = refine_detection_boundaries(video_path, detections, duration)
         write_outputs(args.output_dir, video_path, detections, duration, args.write_debug_files)
         print(f"{video_path.name}:")
         for item in detections:

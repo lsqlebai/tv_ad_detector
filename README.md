@@ -181,19 +181,21 @@ ad_templates/
 
 后续没有 keypoint 的视频也可以用这些模板自动匹配同款广告。
 
-### 精确裁剪模式
+### 裁剪模式
 
-默认裁剪模式是 `copy`，速度快，不重编码，但切点可能受关键帧影响有轻微误差。
+默认裁剪模式是 `reencode`，会按审核表里的毫秒级时间点精确裁剪，适合避免广告边界残留。
 
-如果要更精确地按时间点裁剪：
+如果希望更快、可接受关键帧附近 1-2 秒误差，可以使用 `copy`：
 
 ```bash
-python scripts/cut_ads.py --mode reencode
+python scripts/cut_ads.py --mode copy
 ```
 
 ### 裁剪时多删一点前后边界
 
-例如广告前后各多删 0.3 秒：
+默认不额外扩大裁剪范围。检测阶段会先用高采样率突变帧和黑屏帧精修广告边界，避免靠 padding 误删正片。
+
+如果个别片源确实需要兜底，例如广告前后各多删 0.3 秒：
 
 ```bash
 python scripts/cut_ads.py --padding 0.3
@@ -213,10 +215,10 @@ docker compose run --rm build_review
 docker compose run --rm cut_ads
 ```
 
-### Docker 精确裁剪
+### Docker 快速裁剪
 
 ```bash
-CUT_ARGS="--mode reencode" docker compose run --rm cut_ads
+CUT_ARGS="--mode copy" docker compose run --rm cut_ads
 ```
 
 ### Docker 使用 keypoint 扩充模板

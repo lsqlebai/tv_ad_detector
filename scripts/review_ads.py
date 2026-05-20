@@ -15,6 +15,8 @@ HEADERS = [
     "file",
     "start",
     "end",
+    "start_seconds",
+    "end_seconds",
     "score",
     "kind",
     "review_required",
@@ -23,6 +25,23 @@ HEADERS = [
     "middle_frame",
     "end_frame",
 ]
+
+
+def format_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining = seconds - hours * 3600 - minutes * 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:06.3f}"
+    return f"{minutes}:{remaining:06.3f}"
+
+
+def display_time(row: dict, name: str) -> str:
+    seconds = row.get(f"{name}_seconds")
+    if seconds not in (None, ""):
+        return format_time(float(seconds))
+    return row.get(name, "")
 
 
 def read_candidates(output_dir: Path) -> list[dict]:
@@ -88,8 +107,10 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
         values = [
             row.get("delete", "NO"),
             row.get("file", ""),
-            row.get("start", ""),
-            row.get("end", ""),
+            display_time(row, "start"),
+            display_time(row, "end"),
+            float(row["start_seconds"]) if row.get("start_seconds") else None,
+            float(row["end_seconds"]) if row.get("end_seconds") else None,
             float(row["score"]) if row.get("score") else None,
             row.get("kind", ""),
             row.get("review_required", ""),
@@ -104,33 +125,37 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
             cell.border = border
         dv.add(ws.cell(row=row_index, column=1))
 
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("start_frame", "")), f"I{row_index}", 180, 101)
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("middle_frame", "")), f"J{row_index}", 180, 101)
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("end_frame", "")), f"K{row_index}", 180, 101)
+        add_image(ws, resolve_image_path(output_dir.parent, row.get("start_frame", "")), f"K{row_index}", 180, 101)
+        add_image(ws, resolve_image_path(output_dir.parent, row.get("middle_frame", "")), f"L{row_index}", 180, 101)
+        add_image(ws, resolve_image_path(output_dir.parent, row.get("end_frame", "")), f"M{row_index}", 180, 101)
         ws.row_dimensions[row_index].height = 84
 
     last_row = max(5, len(rows) + 4)
-    ws.auto_filter.ref = f"A4:K{last_row}"
+    ws.auto_filter.ref = f"A4:M{last_row}"
     ws.freeze_panes = "A5"
     ws.column_dimensions["A"].width = 10
     ws.column_dimensions["B"].width = 26
     ws.column_dimensions["C"].width = 10
     ws.column_dimensions["D"].width = 10
     ws.column_dimensions["E"].width = 10
-    ws.column_dimensions["F"].width = 20
-    ws.column_dimensions["G"].width = 16
-    ws.column_dimensions["H"].width = 42
-    ws.column_dimensions["I"].width = 26
-    ws.column_dimensions["J"].width = 26
+    ws.column_dimensions["F"].width = 10
+    ws.column_dimensions["G"].width = 10
+    ws.column_dimensions["H"].width = 20
+    ws.column_dimensions["I"].width = 16
+    ws.column_dimensions["J"].width = 42
     ws.column_dimensions["K"].width = 26
+    ws.column_dimensions["L"].width = 26
+    ws.column_dimensions["M"].width = 26
+    ws.column_dimensions["E"].hidden = True
+    ws.column_dimensions["F"].hidden = True
 
     ws.conditional_formatting.add(
-        f"A5:K{last_row}",
+        f"A5:M{last_row}",
         FormulaRule(formula=["$A5=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A5:K{last_row}",
-        FormulaRule(formula=["$G5=\"yes\""], fill=review_fill),
+        f"A5:M{last_row}",
+        FormulaRule(formula=["$I5=\"yes\""], fill=review_fill),
     )
 
     summary = wb.create_sheet("Summary")

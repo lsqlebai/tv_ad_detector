@@ -106,6 +106,10 @@ def read_review_ranges(path: Path) -> dict[str, list[tuple[float, float]]]:
         file_name = str(ws.cell(row=row_index, column=headers["file"]).value or "").strip()
         start_value = ws.cell(row=row_index, column=headers["start"]).value
         end_value = ws.cell(row=row_index, column=headers["end"]).value
+        if start_value in (None, "") and "start_seconds" in headers:
+            start_value = ws.cell(row=row_index, column=headers["start_seconds"]).value
+        if end_value in (None, "") and "end_seconds" in headers:
+            end_value = ws.cell(row=row_index, column=headers["end_seconds"]).value
         if not file_name or start_value in (None, "") or end_value in (None, ""):
             continue
         start = parse_time(str(start_value))
@@ -136,23 +140,34 @@ def run(command: list[str]) -> None:
 
 
 def cut_segment(ffmpeg: str, source: Path, target: Path, start: float, end: float, mode: str) -> None:
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-ss",
-        format_time(start),
-        "-to",
-        format_time(end),
-        "-i",
-        str(source),
-    ]
     if mode == "copy":
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            format_time(start),
+            "-i",
+            str(source),
+            "-t",
+            format_time(end - start),
+        ]
         command += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
     else:
-        command += [
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-ss",
+            format_time(start),
+            "-to",
+            format_time(end),
             "-c:v",
             "libx264",
             "-preset",
@@ -253,7 +268,7 @@ def main() -> int:
     parser.add_argument("--ads-dir", type=Path, default=Path("output"))
     parser.add_argument("--review-xlsx", type=Path, default=Path("output/ad_review.xlsx"), help="Read delete=YES rows from an ad review workbook.")
     parser.add_argument("--output-dir", type=Path, default=Path("output/cleaned"))
-    parser.add_argument("--mode", choices=["copy", "reencode"], default="copy")
+    parser.add_argument("--mode", choices=["copy", "reencode"], default="reencode")
     parser.add_argument("--padding", type=float, default=0.0, help="Seconds to remove before/after each ad range.")
     args = parser.parse_args()
 
