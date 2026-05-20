@@ -81,6 +81,8 @@ output/ad_review.xlsx
 output/ad_review.xlsx
 ```
 
+如果使用 Docker Web 控制台，也可以直接在页面的“候选审核”区域完成同样操作，并点击“保存审核”。保存后会写回同一个 `output/ad_review.xlsx`，再点击“按审核表裁剪”即可闭环处理。
+
 在 `Review` 工作表中，每一行是一个候选广告段。
 
 关键列：
@@ -135,13 +137,13 @@ output/cleaned/
 输出文件名格式：
 
 ```text
-原文件名.clean.mp4
+原文件名.mp4
 ```
 
 例如：
 
 ```text
-output/cleaned/test.clean.mp4
+output/cleaned/test.mp4
 ```
 
 ## 常用命令
@@ -201,30 +203,70 @@ python scripts/cut_ads.py --mode copy
 python scripts/cut_ads.py --padding 0.3
 ```
 
-## Docker 用法
+## Docker / 群晖 Container Manager 用法
+
+默认 `docker-compose.yml` 会启动一个常驻 Web 控制台，适合放在群晖 Container Manager 里长期运行。
+
+### 启动 Web 控制台
+
+```bash
+docker compose up -d --build
+```
+
+默认端口：
+
+```text
+http://NAS_IP:8787
+```
+
+如果要改端口，例如映射到 `18878`：
+
+```bash
+WEB_PORT=18878 docker compose up -d --build
+```
+
+Web 页面提供：
+
+- 查看并选择 `input/` 下的视频
+- 为选中的输入视频生成 `output/ad_review.xlsx`
+- 在页面里审核候选段，修改 `delete`、`start`、`end` 并保存回审核表
+- 下载审核表，用 Excel 离线审核
+- 一键按审核表裁剪
+- 查看运行日志
+- 下载或批量删除 `output/cleaned/` 下的结果视频，方便修改审核后重新生成
+
+群晖上建议把以下目录作为持久化目录保留：
+
+```text
+input/          放原始视频
+output/         审核表和裁剪结果
+ad_templates/   广告模板库
+```
+
+### 命令行工具
 
 ### 一步生成审核表
 
 ```bash
-docker compose run --rm build_review
+docker compose --profile tools run --rm build_review
 ```
 
 ### 根据审核表裁剪
 
 ```bash
-docker compose run --rm cut_ads
+docker compose --profile tools run --rm cut_ads
 ```
 
 ### Docker 快速裁剪
 
 ```bash
-CUT_ARGS="--mode copy" docker compose run --rm cut_ads
+docker compose --profile tools run --rm cut_ads python scripts/cut_ads.py --mode copy
 ```
 
 ### Docker 使用 keypoint 扩充模板
 
 ```bash
-BUILD_REVIEW_ARGS="--use-keypoints" docker compose run --rm build_review
+docker compose --profile tools run --rm build_review python scripts/build_review.py --use-keypoints
 ```
 
 ## 输出文件说明

@@ -270,9 +270,13 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("output/cleaned"))
     parser.add_argument("--mode", choices=["copy", "reencode"], default="reencode")
     parser.add_argument("--padding", type=float, default=0.0, help="Seconds to remove before/after each ad range.")
+    parser.add_argument("--files", nargs="*", default=[], help="Optional input video filenames to process.")
     args = parser.parse_args()
 
     videos = sorted(args.input_dir.glob("*.mp4"))
+    if args.files:
+        wanted = set(args.files)
+        videos = [path for path in videos if path.name in wanted]
     if not videos:
         raise SystemExit(f"No .mp4 files found in {args.input_dir}")
 

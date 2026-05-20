@@ -1,54 +1,34 @@
 services:
-  pyscenedetect:
-    image: python:3.11-slim
-    container_name: pyscenedetect-lab
+  web:
+    build: .
+    container_name: tv-ad-detector
     working_dir: /work
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8787}:8787"
     volumes:
-      - .:/work
-      - ./input:/input
-      - ./output:/output
-    tty: true
-    stdin_open: true
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /work/requirements.txt &&
-        python /work/scripts/detect_ads.py $${DETECT_ARGS:-}
-      "
-
-  cut_ads:
-    image: python:3.11-slim
-    working_dir: /work
-    volumes:
-      - .:/work
-      - ./input:/input
-      - ./output:/output
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /work/requirements.txt &&
-        python /work/scripts/cut_ads.py $${CUT_ARGS:-}
-      "
-
-  review_ads:
-    image: python:3.11-slim
-    working_dir: /work
-    volumes:
-      - .:/work
-      - ./output:/output
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /work/requirements.txt &&
-        python /work/scripts/review_ads.py $${REVIEW_ARGS:-}
-      "
+      - ./input:/work/input
+      - ./output:/work/output
+      - ./ad_templates:/work/ad_templates
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
 
   build_review:
-    image: python:3.11-slim
+    profiles: ["tools"]
+    build: .
     working_dir: /work
     volumes:
-      - .:/work
-      - ./input:/input
-      - ./output:/output
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /work/requirements.txt &&
-        python /work/scripts/build_review.py $${BUILD_REVIEW_ARGS:-}
-      "
+      - ./input:/work/input
+      - ./output:/work/output
+      - ./ad_templates:/work/ad_templates
+    command: python scripts/build_review.py
+
+  cut_ads:
+    profiles: ["tools"]
+    build: .
+    working_dir: /work
+    volumes:
+      - ./input:/work/input
+      - ./output:/work/output
+      - ./ad_templates:/work/ad_templates
+    command: python scripts/cut_ads.py

@@ -23,6 +23,7 @@ def main() -> int:
     parser.add_argument("--clean-detect", action="store_true", default=True)
     parser.add_argument("--keep-detect", action="store_false", dest="clean_detect")
     parser.add_argument("--detect-extra", default="", help="Extra arguments passed to detect_ads.py.")
+    parser.add_argument("--files", nargs="*", default=[], help="Optional input video filenames to process.")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -45,6 +46,9 @@ def main() -> int:
         detect_command.append("--ignore-keypoints")
     if args.detect_extra:
         detect_command.extend(args.detect_extra.split())
+    if args.files:
+        detect_command.append("--files")
+        detect_command.extend(args.files)
 
     review_command = [
         sys.executable,

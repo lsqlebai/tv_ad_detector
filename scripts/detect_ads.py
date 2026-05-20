@@ -856,6 +856,7 @@ def main() -> int:
     parser.add_argument("--auto-threshold", type=float, default=0.80, help="Minimum score for automatic ad candidates.")
     parser.add_argument("--max-auto-candidates", type=int, default=8, help="Maximum automatic candidates per video.")
     parser.add_argument("--min-gap", type=float, default=8.0, help="Minimum seconds between detections.")
+    parser.add_argument("--files", nargs="*", default=[], help="Optional input video filenames to process.")
     parser.add_argument("--no-auto-discover", action="store_true", help="Disable automatic ad discovery.")
     parser.add_argument("--no-refine-boundaries", action="store_true", help="Disable high-rate scene-cut and dark-frame boundary refinement.")
     parser.add_argument("--write-debug-files", action="store_true", help="Also write *.ads.txt, *.candidates.txt, *.ads.json, and keyframe contact sheets.")
@@ -869,6 +870,9 @@ def main() -> int:
         print(f"No keypoints found in {args.keypoints}; using template library plus automatic discovery.")
 
     videos = sorted(args.input_dir.glob("*.mp4"))
+    if args.files:
+        wanted = set(args.files)
+        videos = [path for path in videos if path.name in wanted]
     if not videos:
         raise SystemExit(f"No .mp4 files found in {args.input_dir}")
 
