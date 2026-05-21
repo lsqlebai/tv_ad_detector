@@ -5,10 +5,12 @@ import argparse
 import csv
 import json
 import mimetypes
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from zipfile import BadZipFile
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +26,7 @@ OUTPUT_DIR = ROOT / "output"
 REVIEW_XLSX = OUTPUT_DIR / "ad_review.xlsx"
 CLEANED_DIR = OUTPUT_DIR / "cleaned"
 DETECT_DIR = OUTPUT_DIR / "detect"
+FRAME_FIELDS = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"]
 
 
 @dataclass
@@ -74,8 +77,17 @@ def safe_cleaned_file(value: str) -> Path | None:
 
 
 def snapshot() -> dict:
+    return {
+        "job": job_snapshot(),
+        "inputs": list_files(INPUT_DIR, "*.mp4"),
+        "review": file_item(REVIEW_XLSX) if REVIEW_XLSX.exists() else None,
+        "cleaned": list_files(CLEANED_DIR, "*.mp4"),
+    }
+
+
+def job_snapshot() -> dict:
     with JOB_LOCK:
-        job = {
+        return {
             "running": JOB.running,
             "name": JOB.name,
             "started_at": JOB.started_at,
@@ -83,12 +95,6 @@ def snapshot() -> dict:
             "returncode": JOB.returncode,
             "log": JOB.log[-300:],
         }
-    return {
-        "job": job,
-        "inputs": list_files(INPUT_DIR, "*.mp4"),
-        "review": file_item(REVIEW_XLSX) if REVIEW_XLSX.exists() else None,
-        "cleaned": list_files(CLEANED_DIR, "*.mp4"),
-    }
 
 
 def append_log(line: str) -> None:
@@ -96,6 +102,13 @@ def append_log(line: str) -> None:
         JOB.log.append(line.rstrip())
         if len(JOB.log) > 1000:
             del JOB.log[: len(JOB.log) - 1000]
+
+
+def clear_review_outputs() -> None:
+    REVIEW_XLSX.unlink(missing_ok=True)
+    REVIEW_XLSX.with_suffix(".tmp.xlsx").unlink(missing_ok=True)
+    if DETECT_DIR.exists():
+        shutil.rmtree(DETECT_DIR)
 
 
 def run_job(name: str, command: list[str]) -> None:
@@ -189,9 +202,11 @@ def detect_frame_indexes() -> tuple[dict[tuple[str, float, float], dict], dict[s
         with csv_path.open(newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 frame_data = {
+                    "start_before_frame": row.get("start_before_frame", ""),
                     "start_frame": row.get("start_frame", ""),
                     "middle_frame": row.get("middle_frame", ""),
                     "end_frame": row.get("end_frame", ""),
+                    "end_after_frame": row.get("end_after_frame", ""),
                 }
                 by_file.setdefault(video_name, []).append(frame_data)
                 try:
@@ -206,7 +221,10 @@ def detect_frame_indexes() -> tuple[dict[tuple[str, float, float], dict], dict[s
 def read_review_rows() -> list[dict]:
     if not REVIEW_XLSX.exists():
         return []
-    wb = load_workbook(REVIEW_XLSX, data_only=True)
+    try:
+        wb = load_workbook(REVIEW_XLSX, data_only=True)
+    except BadZipFile as exc:
+        raise RuntimeError("审核表文件不是有效的 xlsx，请重新生成审核表。") from exc
     if "Review" not in wb.sheetnames:
         return []
     ws = wb["Review"]
@@ -214,7 +232,7 @@ def read_review_rows() -> list[dict]:
     frames_by_key, frames_by_file = detect_frame_indexes()
     file_offsets: dict[str, int] = {}
     rows: list[dict] = []
-    optional = ["score", "kind", "review_required", "sources", "start_frame", "middle_frame", "end_frame"]
+    optional = ["score", "kind", "review_required", "sources", *FRAME_FIELDS]
     for row_index in range(header_row + 1, ws.max_row + 1):
         file_name = str(ws.cell(row=row_index, column=headers["file"]).value or "").strip()
         if not file_name:
@@ -228,23 +246,26 @@ def read_review_rows() -> list[dict]:
         }
         for name in optional:
             row[name] = str(ws.cell(row=row_index, column=headers[name]).value or "").strip() if name in headers else ""
-        if not any(row.get(name) for name in ("start_frame", "middle_frame", "end_frame")):
-            try:
-                start_seconds = round(parse_time_value(row["start"]), 3)
-                end_seconds = round(parse_time_value(row["end"]), 3)
-            except ValueError:
-                start_seconds = end_seconds = -1.0
-            frame_data = frames_by_key.get((file_name, start_seconds, end_seconds))
-            if frame_data is None:
-                offset = file_offsets.get(file_name, 0)
-                frame_rows = frames_by_file.get(file_name, [])
-                frame_data = frame_rows[offset] if offset < len(frame_rows) else None
-                file_offsets[file_name] = offset + 1
-            if frame_data:
-                row.update(frame_data)
-        for name in ("start_frame", "middle_frame", "end_frame"):
+        try:
+            start_seconds = round(parse_time_value(row["start"]), 3)
+            end_seconds = round(parse_time_value(row["end"]), 3)
+        except ValueError:
+            start_seconds = end_seconds = -1.0
+        frame_data = frames_by_key.get((file_name, start_seconds, end_seconds))
+        if frame_data is None:
+            offset = file_offsets.get(file_name, 0)
+            frame_rows = frames_by_file.get(file_name, [])
+            frame_data = frame_rows[offset] if offset < len(frame_rows) else None
+            file_offsets[file_name] = offset + 1
+        if frame_data:
+            for name in FRAME_FIELDS:
+                if not row.get(name):
+                    row[name] = frame_data.get(name, "")
+        for name in FRAME_FIELDS:
             frame_path = row.get(name, "")
-            if frame_path:
+            if frame_path in {"__VIDEO_END__", "视频结束"}:
+                row[f"{name}_label"] = "视频结束"
+            elif frame_path:
                 row[f"{name}_url"] = file_url(frame_path, inline=True)
                 row[f"{name}_download_url"] = file_url(frame_path, inline=False)
         rows.append(row)
@@ -254,7 +275,10 @@ def read_review_rows() -> list[dict]:
 def save_review_rows(rows: list[dict]) -> int:
     if not REVIEW_XLSX.exists():
         raise RuntimeError("Review workbook does not exist")
-    wb = load_workbook(REVIEW_XLSX)
+    try:
+        wb = load_workbook(REVIEW_XLSX)
+    except BadZipFile as exc:
+        raise RuntimeError("审核表文件不是有效的 xlsx，请重新生成审核表。") from exc
     if "Review" not in wb.sheetnames:
         raise RuntimeError("No Review sheet in workbook")
     ws = wb["Review"]
@@ -284,7 +308,9 @@ def save_review_rows(rows: list[dict]) -> int:
         if "end_seconds" in headers:
             ws.cell(row=row_index, column=headers["end_seconds"], value=end_seconds)
         changed += 1
-    wb.save(REVIEW_XLSX)
+    tmp_path = REVIEW_XLSX.with_suffix(".tmp.xlsx")
+    wb.save(tmp_path)
+    tmp_path.replace(REVIEW_XLSX)
     return changed
 
 
@@ -361,24 +387,76 @@ INDEX_HTML = r"""<!doctype html>
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     label { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
     input[type="number"] { width: 88px; }
-    input.time { width: 86px; padding: 0 8px; }
+    input.time { width: 78px; padding: 0 6px; }
     table { width: 100%; border-collapse: collapse; }
+    table.review-table { table-layout: fixed; }
+    table.review-table col.file-col { width: 118px; }
+    table.review-table col.decision-col { width: 74px; }
+    table.review-table col.time-col { width: 88px; }
+    table.review-table col.score-col { width: 58px; }
+    table.review-table col.kind-col { width: 50px; }
+    table.review-table col.status-col { width: 74px; }
     th, td {
       border-bottom: 1px solid var(--line);
-      padding: 9px 6px;
+      padding: 8px 5px;
       text-align: left;
       vertical-align: middle;
       overflow-wrap: normal;
     }
-    td.file { max-width: 250px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    table.review-table th,
+    table.review-table td { text-align: center; }
+    table.review-table th.file-heading,
+    table.review-table td.file { text-align: left; }
+    td.file {
+      width: 118px;
+      max-width: 118px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.25;
+      vertical-align: middle;
+    }
     td.compact, th.compact { white-space: nowrap; width: 1%; }
+    select.review-decision { width: 64px; padding: 0 6px; }
     th { color: var(--muted); font-weight: 600; font-size: 12px; }
     td img {
       display: block;
-      width: 116px;
+      width: 104px;
       aspect-ratio: 16 / 9;
       object-fit: cover;
       border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f0f2f5;
+    }
+    .frame-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 104px;
+      aspect-ratio: 16 / 9;
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .image-preview {
+      position: fixed;
+      z-index: 1000;
+      pointer-events: none;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 18px 60px rgba(15, 23, 42, 0.25);
+    }
+    .image-preview img {
+      display: block;
+      width: min(70vw, 920px);
+      max-height: 72vh;
+      object-fit: contain;
+      border: 0;
       border-radius: 6px;
       background: #f0f2f5;
     }
@@ -399,6 +477,7 @@ INDEX_HTML = r"""<!doctype html>
     .pill.warn { color: var(--warn); border-color: #f1d0a3; background: #fff7ed; }
     .pill.danger { color: var(--danger); border-color: #f0b8b8; background: #fff1f1; }
     .table-wrap { overflow-x: auto; }
+    th.frames-heading { text-align: center; }
     .review-actions {
       display: flex;
       justify-content: space-between;
@@ -406,7 +485,8 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
       margin-bottom: 12px;
     }
-    .frame-strip { display: grid; grid-template-columns: repeat(3, 116px); gap: 8px; }
+    .frames-cell { width: auto; text-align: right; }
+    .frame-strip { display: inline-grid; grid-template-columns: repeat(5, 104px); gap: 6px; }
     .module-head {
       display: flex;
       align-items: center;
@@ -467,7 +547,6 @@ INDEX_HTML = r"""<!doctype html>
         <h2 style="margin:0">候选审核</h2>
         <div class="actions">
           <span id="review" class="muted">暂无审核表</span>
-          <button id="saveReviewBtn" class="secondary" onclick="saveReview()" disabled>保存审核</button>
           <button id="cutBtn" onclick="startCut()">按当前审核裁剪</button>
           <label>模式
             <select id="mode">
@@ -484,24 +563,41 @@ INDEX_HTML = r"""<!doctype html>
       <div id="reviewRows" class="muted">生成审核表后可在这里编辑</div>
     </section>
     <section class="wide">
-      <h2>日志</h2>
+      <div class="module-head">
+        <h2>日志</h2>
+        <div class="actions">
+          <button class="secondary" onclick="copyLog()">复制日志</button>
+          <span id="copyStatus" class="muted"></span>
+        </div>
+      </div>
       <pre id="log"></pre>
     </section>
   </main>
+  <div id="imagePreview" class="image-preview" hidden><img alt="preview"></div>
   <script>
     const stateEl = document.getElementById("state");
     const buildBtn = document.getElementById("buildBtn");
     const cutBtn = document.getElementById("cutBtn");
     const deleteCleanedBtn = document.getElementById("deleteCleanedBtn");
-    const saveReviewBtn = document.getElementById("saveReviewBtn");
     const reviewRowsEl = document.getElementById("reviewRows");
     const reviewStatusEl = document.getElementById("reviewStatus");
+    const copyStatusEl = document.getElementById("copyStatus");
     const logEl = document.getElementById("log");
+    const imagePreviewEl = document.getElementById("imagePreview");
+    const imagePreviewImg = imagePreviewEl.querySelector("img");
     let reviewRows = [];
     let reviewDirty = false;
+    let reviewRevision = 0;
+    let reviewSaveTimer = null;
+    let reviewSaveInFlight = false;
+    let reviewTableScroll = {left: 0, top: 0};
     let selectedInputs = new Set();
     let selectedCleaned = new Set();
     let initializedInputSelection = false;
+    let lastJobRunning = false;
+    let lastJobName = "";
+    let imagePreviewTimer = null;
+    let imagePreviewAnchor = null;
 
     function sizeText(bytes) {
       if (bytes > 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
@@ -515,6 +611,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function shortKind(value) {
+      return ({
+        auto_discovery: "自动",
+        template_library: "模板",
+        template_match: "模板",
+        manual_confirmed: "手动",
+        manual_open_to_end: "手动"
+      })[value] || value || "";
     }
     function syncSelection(set, files) {
       const allowed = new Set(files.map(item => item.name));
@@ -548,7 +653,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     function updateSelectionButtons() {
       buildBtn.disabled = currentRunning || selectedInputs.size === 0;
-      cutBtn.disabled = currentRunning || !currentHasReview;
+      cutBtn.disabled = currentRunning || !currentHasReview || reviewSaveInFlight;
       deleteCleanedBtn.disabled = currentRunning || selectedCleaned.size === 0;
     }
     let latestInputs = [];
@@ -567,57 +672,164 @@ INDEX_HTML = r"""<!doctype html>
         `<tr><td class="compact"><input type="checkbox" ${selected.has(item.name) ? "checked" : ""} onchange="setSelectionByIndex('${kind}', ${index}, this.checked)"></td><td>${fileLink(item)}</td><td class="compact">${sizeText(item.size)}</td></tr>`
       ).join("")}</tbody></table>`;
     }
-    function setReviewDirty(value) {
+    function setReviewDirty(value, schedule = true) {
       reviewDirty = value;
-      saveReviewBtn.disabled = !value;
-      reviewStatusEl.textContent = value ? "有未保存修改" : "";
+      if (value) {
+        reviewStatusEl.textContent = "等待自动保存";
+        if (schedule) scheduleReviewSave();
+      } else if (!reviewSaveInFlight) {
+        if (reviewSaveTimer) {
+          clearTimeout(reviewSaveTimer);
+          reviewSaveTimer = null;
+        }
+        reviewStatusEl.textContent = "";
+      }
+      updateSelectionButtons();
     }
     function updateReviewRow(index, field, value) {
       reviewRows[index][field] = value;
+      reviewRevision += 1;
       setReviewDirty(true);
     }
+    function rememberReviewScroll() {
+      const wrap = reviewRowsEl.querySelector(".table-wrap");
+      if (!wrap) return;
+      reviewTableScroll = {left: wrap.scrollLeft, top: wrap.scrollTop};
+    }
+    function restoreReviewScroll() {
+      const wrap = reviewRowsEl.querySelector(".table-wrap");
+      if (!wrap) return;
+      wrap.scrollLeft = reviewTableScroll.left;
+      wrap.scrollTop = reviewTableScroll.top;
+      wrap.addEventListener("scroll", rememberReviewScroll, {passive: true});
+    }
+    function positionImagePreview(event) {
+      if (imagePreviewEl.hidden) return;
+      const margin = 14;
+      const rect = imagePreviewEl.getBoundingClientRect();
+      let left = event.clientX + margin;
+      let top = event.clientY + margin;
+      if (left + rect.width > window.innerWidth - margin) left = event.clientX - rect.width - margin;
+      if (top + rect.height > window.innerHeight - margin) top = event.clientY - rect.height - margin;
+      imagePreviewEl.style.left = Math.max(margin, left) + "px";
+      imagePreviewEl.style.top = Math.max(margin, top) + "px";
+    }
+    function hideImagePreview() {
+      if (imagePreviewTimer) {
+        clearTimeout(imagePreviewTimer);
+        imagePreviewTimer = null;
+      }
+      imagePreviewAnchor = null;
+      imagePreviewEl.hidden = true;
+      imagePreviewImg.removeAttribute("src");
+    }
+    function scheduleImagePreview(anchor, event) {
+      if (imagePreviewAnchor === anchor && !imagePreviewEl.hidden) {
+        positionImagePreview(event);
+        return;
+      }
+      hideImagePreview();
+      imagePreviewAnchor = anchor;
+      imagePreviewTimer = setTimeout(() => {
+        if (imagePreviewAnchor !== anchor) return;
+        imagePreviewImg.src = anchor.dataset.preview;
+        imagePreviewEl.hidden = false;
+        positionImagePreview(event);
+      }, 2000);
+    }
+    function clearReviewRows(message = "正在生成新的审核表...") {
+      if (reviewSaveTimer) {
+        clearTimeout(reviewSaveTimer);
+        reviewSaveTimer = null;
+      }
+      reviewRows = [];
+      reviewDirty = false;
+      reviewSaveInFlight = false;
+      reviewRevision += 1;
+      reviewTableScroll = {left: 0, top: 0};
+      currentHasReview = false;
+      document.getElementById("review").innerHTML = '<span class="muted">暂无审核表</span>';
+      reviewRowsEl.innerHTML = `<span class="muted">${escapeHtml(message)}</span>`;
+      reviewStatusEl.textContent = "";
+      updateSelectionButtons();
+    }
     function renderReviewRows(rows) {
+      rememberReviewScroll();
       reviewRows = rows;
       if (!rows.length) {
         reviewRowsEl.innerHTML = '<span class="muted">暂无候选。请先生成审核表。</span>';
-        saveReviewBtn.disabled = true;
+        setReviewDirty(false, false);
+        reviewTableScroll = {left: 0, top: 0};
         return;
       }
-      reviewRowsEl.innerHTML = `<div class="table-wrap"><table><thead><tr>
-        <th class="compact">删除</th><th>文件</th><th class="compact">开始</th><th class="compact">结束</th><th class="compact">分数</th><th class="compact">来源</th><th class="compact">状态</th><th>截图</th>
+      const fileSpans = rows.map((row, index) => {
+        if (index > 0 && rows[index - 1].file === row.file) return 0;
+        let span = 1;
+        while (rows[index + span] && rows[index + span].file === row.file) span += 1;
+        return span;
+      });
+      reviewRowsEl.innerHTML = `<div class="table-wrap"><table class="review-table"><colgroup><col class="file-col"><col class="decision-col"><col class="time-col"><col class="time-col"><col class="score-col"><col class="kind-col"><col class="status-col"><col></colgroup><thead><tr>
+        <th class="file-heading">文件</th><th class="compact">删除</th><th class="compact">开始</th><th class="compact">结束</th><th class="compact">分数</th><th class="compact">来源</th><th class="compact">状态</th><th class="frames-heading">截图</th>
       </tr></thead><tbody>${rows.map((row, index) => {
-        const frames = ["start_frame", "middle_frame", "end_frame"].map(key => row[`${key}_url`] ? `<a href="${row[`${key}_download_url`]}"><img src="${row[`${key}_url`]}" alt="${key}" loading="lazy"></a>` : "").join("");
+        const frames = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"].map(key => {
+          if (row[`${key}_label`]) return `<span class="frame-placeholder">${escapeHtml(row[`${key}_label`])}</span>`;
+          return row[`${key}_url`] ? `<a class="frame-link" href="${escapeHtml(row[`${key}_download_url`])}" data-preview="${escapeHtml(row[`${key}_url`])}"><img src="${escapeHtml(row[`${key}_url`])}" alt="${key}" loading="lazy"></a>` : '<span class="frame-placeholder">无截图</span>';
+        }).join("");
+        const fileCell = fileSpans[index] ? `<td class="file" rowspan="${fileSpans[index]}" title="${escapeHtml(row.file)}">${escapeHtml(row.file)}</td>` : "";
         return `<tr>
-          <td class="compact"><select onchange="updateReviewRow(${index}, 'delete', this.value)">
+          ${fileCell}
+          <td class="compact"><select class="review-decision" onchange="updateReviewRow(${index}, 'delete', this.value)">
             <option value="YES" ${row.delete === "YES" ? "selected" : ""}>YES</option>
             <option value="NO" ${row.delete !== "YES" ? "selected" : ""}>NO</option>
           </select></td>
-          <td class="file" title="${escapeHtml(row.file)}">${escapeHtml(row.file)}</td>
-          <td class="compact"><input class="time" value="${escapeHtml(row.start)}" onchange="updateReviewRow(${index}, 'start', this.value)"></td>
-          <td class="compact"><input class="time" value="${escapeHtml(row.end)}" onchange="updateReviewRow(${index}, 'end', this.value)"></td>
+          <td class="compact"><input class="time" value="${escapeHtml(row.start)}" oninput="updateReviewRow(${index}, 'start', this.value)"></td>
+          <td class="compact"><input class="time" value="${escapeHtml(row.end)}" oninput="updateReviewRow(${index}, 'end', this.value)"></td>
           <td class="compact">${escapeHtml(row.score || "")}</td>
-          <td class="compact">${escapeHtml(row.kind || "")}</td>
+          <td class="compact" title="${escapeHtml(row.kind || "")}">${escapeHtml(shortKind(row.kind))}</td>
           <td class="compact">${row.review_required === "yes" ? '<span class="pill warn">需确认</span>' : '<span class="pill ok">可信</span>'}</td>
-          <td style="min-width:380px"><div class="frame-strip">${frames}</div></td>
+          <td class="frames-cell"><div class="frame-strip">${frames}</div></td>
         </tr>`;
       }).join("")}</tbody></table></div>`;
-      setReviewDirty(false);
+      setReviewDirty(false, false);
+      restoreReviewScroll();
     }
+    reviewRowsEl.addEventListener("mouseover", event => {
+      const anchor = event.target.closest(".frame-link");
+      if (!anchor || !reviewRowsEl.contains(anchor)) return;
+      scheduleImagePreview(anchor, event);
+    });
+    reviewRowsEl.addEventListener("mousemove", event => {
+      const anchor = event.target.closest(".frame-link");
+      if (!anchor || !reviewRowsEl.contains(anchor)) return;
+      if (imagePreviewAnchor === anchor) positionImagePreview(event);
+    });
+    reviewRowsEl.addEventListener("mouseout", event => {
+      const anchor = event.target.closest(".frame-link");
+      if (!anchor || !reviewRowsEl.contains(anchor)) return;
+      if (anchor.contains(event.relatedTarget)) return;
+      hideImagePreview();
+    });
+    window.addEventListener("scroll", hideImagePreview, {passive: true});
     async function loadReviewRows(force) {
-      if (reviewDirty && !force) return;
+      if ((reviewDirty || reviewSaveInFlight) && !force) return;
+      if (!force && reviewRowsEl.contains(document.activeElement)) return;
       const response = await fetch("/api/review");
       if (!response.ok) return;
       const data = await response.json();
       renderReviewRows(data.rows || []);
     }
-    async function refresh() {
-      const data = await fetch("/api/status").then(r => r.json());
+    function updateJobStatus(data) {
       const running = data.job.running;
       currentRunning = running;
-      currentHasReview = Boolean(data.review);
       stateEl.className = "pill " + (running ? "warn" : data.job.returncode === 0 ? "ok" : data.job.returncode ? "danger" : "");
       stateEl.textContent = running ? `${data.job.name} 运行中` : data.job.returncode === 0 ? "空闲，上次成功" : data.job.returncode ? "空闲，上次失败" : "空闲";
+      logEl.textContent = data.job.log.join("\n");
+      logEl.scrollTop = logEl.scrollHeight;
+      updateSelectionButtons();
+    }
+    function renderFiles(data) {
       document.getElementById("review").innerHTML = data.review ? fileLink(data.review) : '<span class="muted">暂无</span>';
+      currentHasReview = Boolean(data.review);
       latestInputs = data.inputs;
       latestCleaned = data.cleaned;
       ensureDefaultInputSelection(latestInputs);
@@ -626,37 +838,98 @@ INDEX_HTML = r"""<!doctype html>
       renderSelectableList("inputs", "input", latestInputs);
       renderSelectableList("cleaned", "cleaned", latestCleaned);
       updateSelectionButtons();
-      logEl.textContent = data.job.log.join("\n");
-      logEl.scrollTop = logEl.scrollHeight;
-      if (data.review) await loadReviewRows(false);
-      else renderReviewRows([]);
+    }
+    async function refreshPageData(options = {}) {
+      const data = await fetch("/api/status").then(r => r.json());
+      updateJobStatus(data);
+      lastJobRunning = data.job.running;
+      lastJobName = data.job.name || lastJobName;
+      if (options.files) renderFiles(data);
+      if (data.review) {
+        if (options.review || reviewRows.length === 0) await loadReviewRows(Boolean(options.review));
+      } else if (data.job.running && data.job.name === "生成审核表") {
+        clearReviewRows("正在生成新的审核表...");
+      } else if (options.review || reviewRows.length === 0) {
+        renderReviewRows([]);
+      }
+    }
+    async function pollJob() {
+      const data = await fetch("/api/job").then(r => r.json());
+      const wasRunning = lastJobRunning;
+      const previousJobName = lastJobName;
+      updateJobStatus(data);
+      lastJobRunning = data.job.running;
+      lastJobName = data.job.name || lastJobName;
+      if (data.job.running) return;
+      if (!wasRunning) return;
+      if (previousJobName === "生成审核表") {
+        await refreshPageData({files: true, review: true});
+      } else if (previousJobName === "裁剪视频") {
+        await refreshPageData({files: true, review: false});
+      }
     }
     async function postJson(url, payload) {
       const response = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload || {})});
       if (!response.ok) alert(await response.text());
-      await refresh();
+      await refreshPageData({files: true, review: false});
     }
-    async function saveReview() {
+    function scheduleReviewSave(delay = 800) {
+      if (reviewSaveTimer) clearTimeout(reviewSaveTimer);
+      reviewSaveTimer = setTimeout(() => {
+        reviewSaveTimer = null;
+        saveReview(false);
+      }, delay);
+    }
+    async function saveReview(reload = false) {
+      if (!reviewDirty) return true;
+      if (reviewSaveTimer) {
+        clearTimeout(reviewSaveTimer);
+        reviewSaveTimer = null;
+      }
+      if (reviewSaveInFlight) return false;
+      reviewSaveInFlight = true;
+      const savingRevision = reviewRevision;
+      reviewStatusEl.textContent = "正在保存...";
+      updateSelectionButtons();
       const response = await fetch("/api/review", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({rows: reviewRows})});
       const data = await response.json().catch(() => ({}));
+      reviewSaveInFlight = false;
       if (!response.ok) {
-        alert(data.message || "保存失败");
-        return;
+        reviewStatusEl.textContent = data.message || "自动保存失败";
+        updateSelectionButtons();
+        return false;
       }
-      setReviewDirty(false);
-      reviewStatusEl.textContent = `已保存 ${data.changed} 行`;
-      await loadReviewRows(true);
+      if (reviewRevision === savingRevision) {
+        setReviewDirty(false, false);
+        reviewStatusEl.textContent = `已自动保存 ${data.changed} 行`;
+        setTimeout(() => {
+          if (!reviewDirty && !reviewSaveInFlight) reviewStatusEl.textContent = "";
+        }, 1800);
+        if (reload) await loadReviewRows(true);
+      } else {
+        setReviewDirty(true);
+      }
+      updateSelectionButtons();
+      return true;
     }
     function startBuild() {
       if (selectedInputs.size === 0) {
         alert("请先选择要处理的输入视频。");
         return;
       }
+      clearReviewRows();
       postJson("/api/build-review", {files: Array.from(selectedInputs)});
     }
-    function startCut() {
+    async function startCut() {
       if (reviewDirty) {
-        alert("请先保存审核修改，再执行裁剪。");
+        const saved = await saveReview(false);
+        if (!saved || reviewDirty) {
+          alert("审核修改还没有保存成功，请检查时间格式后再裁剪。");
+          return;
+        }
+      }
+      if (reviewSaveInFlight) {
+        alert("审核正在保存，请稍后再裁剪。");
         return;
       }
       postJson("/api/cut", {
@@ -672,8 +945,23 @@ INDEX_HTML = r"""<!doctype html>
       if (!confirm(`删除 ${selectedCleaned.size} 个裁剪结果？`)) return;
       postJson("/api/delete-cleaned", {files: Array.from(selectedCleaned)});
     }
-    refresh();
-    setInterval(refresh, 2500);
+    async function copyLog() {
+      const text = logEl.textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        copyStatusEl.textContent = "已复制";
+      } catch (error) {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(logEl);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        copyStatusEl.textContent = "已选中";
+      }
+      setTimeout(() => { copyStatusEl.textContent = ""; }, 1800);
+    }
+    refreshPageData({files: true, review: true});
+    setInterval(pollJob, 2500);
   </script>
 </body>
 </html>
@@ -714,6 +1002,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self.send_json(snapshot())
             return
+        if parsed.path == "/api/job":
+            self.send_json({"job": job_snapshot()})
+            return
         if parsed.path == "/api/review":
             try:
                 self.send_json({"rows": read_review_rows()})
@@ -747,6 +1038,11 @@ class Handler(BaseHTTPRequestHandler):
             if not files:
                 self.send_json({"ok": False, "message": "请选择要处理的输入视频"}, 400)
                 return
+            with JOB_LOCK:
+                if JOB.running:
+                    self.send_json({"ok": False, "message": f"{JOB.name} is already running"}, 409)
+                    return
+            clear_review_outputs()
             command = [sys.executable, str(ROOT / "scripts" / "build_review.py"), "--files", *files]
             ok, message = start_job("生成审核表", command)
             self.send_json({"ok": ok, "message": message}, 200 if ok else 409)

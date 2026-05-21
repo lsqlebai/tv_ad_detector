@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,10 @@ def format_time(seconds: float) -> str:
     minutes = int((seconds % 3600) // 60)
     remaining = seconds - hours * 3600 - minutes * 60
     return f"{hours:02d}:{minutes:02d}:{remaining:06.3f}"
+
+
+def format_range(start: float, end: float) -> str:
+    return f"{format_time(start)}-{format_time(end)} ({end - start:.3f}s)"
 
 
 def ffprobe_duration(ffmpeg: str, video_path: Path) -> float:
@@ -136,6 +141,7 @@ def keep_ranges(ad_ranges: list[tuple[float, float]], duration: float, padding: 
 
 
 def run(command: list[str]) -> None:
+    print(f"  $ {shlex.join(command)}", flush=True)
     subprocess.run(command, check=True)
 
 
@@ -233,6 +239,7 @@ def process_video(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / video_path.name
 
+    print(f"{video_path.name}: duration={format_time(duration)} mode={mode} padding={padding:.3f}s source={source}", flush=True)
     if not ads:
         print(f"{video_path.name}: no ads in {source}, skipping")
         return
@@ -242,14 +249,23 @@ def process_video(
         print(f"{video_path.name}: all content marked as ads, skipping")
         return
 
+    print(f"{video_path.name}: remove {len(ads)} range(s)", flush=True)
+    for index, (start, end) in enumerate(ads, start=1):
+        print(f"  ad {index:02d}: {format_range(start, end)}", flush=True)
+    print(f"{video_path.name}: keep {len(keeps)} segment(s)", flush=True)
+    for index, (start, end) in enumerate(keeps, start=1):
+        print(f"  keep {index:02d}: {format_range(start, end)}", flush=True)
+
     tmp_dir = output_dir / f".{video_path.stem}.segments"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     segments: list[Path] = []
     try:
         for index, (start, end) in enumerate(keeps, start=1):
             segment_path = tmp_dir / f"{index:03d}.mp4"
+            print(f"{video_path.name}: cutting segment {index}/{len(keeps)} -> {segment_path.name}", flush=True)
             cut_segment(ffmpeg, video_path, segment_path, start, end, mode)
             segments.append(segment_path)
+        print(f"{video_path.name}: concatenating {len(segments)} segment(s) -> {output_path}", flush=True)
         concat_segments(ffmpeg, segments, output_path)
     finally:
         for segment in segments:
@@ -259,7 +275,10 @@ def process_video(
         except OSError:
             pass
 
-    print(f"{video_path.name}: removed {len(ads)} ad range(s), wrote {output_path}")
+    if output_path.exists():
+        print(f"{video_path.name}: removed {len(ads)} ad range(s), wrote {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)", flush=True)
+    else:
+        print(f"{video_path.name}: removed {len(ads)} ad range(s), but output file is missing: {output_path}", flush=True)
 
 
 def main() -> int:

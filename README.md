@@ -207,9 +207,37 @@ python scripts/cut_ads.py --padding 0.3
 
 默认 `docker-compose.yml` 会启动一个常驻 Web 控制台，适合放在群晖 Container Manager 里长期运行。
 
-`docker-compose.yml` 是自包含的：它会在构建镜像时从 GitHub 拉取项目代码、脚本和 `ad_templates/` 模板库，并在 compose 文件里内嵌构建步骤。群晖上只需要放这个 compose 文件，以及持久化的 `input/`、`output/` 目录，不需要额外上传 Dockerfile、scripts 或 ad templates。
+### 生成 NAS 部署包
+
+在开发机或本地仓库目录运行：
+
+```bash
+python scripts/package_docker_bundle.py
+```
+
+会生成：
+
+```text
+dist/tv_ad_detector_docker_bundle.zip
+```
+
+把这个 zip 上传到群晖并解压。zip 内包含 Docker 启动所需的文件：
+
+```text
+docker-compose.yml
+Dockerfile
+requirements.txt
+scripts/
+ad_templates/
+input/
+output/
+```
+
+`scripts/` 会作为目录挂载进容器。后续如果只是修脚本逻辑，可以替换 NAS 上的 `scripts/` 文件后重启容器，不需要重新构建镜像。
 
 ### 启动 Web 控制台
+
+进入解压后的目录，然后运行：
 
 ```bash
 docker compose up -d --build
@@ -227,12 +255,6 @@ http://NAS_IP:8787
 WEB_PORT=18878 docker compose up -d --build
 ```
 
-如果要构建其它分支或自己的 fork，可以指定：
-
-```bash
-APP_REPO=https://github.com/lsqlebai/tv_ad_detector.git#main docker compose up -d --build
-```
-
 Web 页面提供：
 
 - 查看并选择 `input/` 下的视频
@@ -248,6 +270,8 @@ Web 页面提供：
 ```text
 input/          放原始视频
 output/         审核表和裁剪结果
+ad_templates/   广告模板库
+scripts/        脚本目录，便于修 bug 后直接替换
 ```
 
 ### 命令行工具

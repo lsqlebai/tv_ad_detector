@@ -28,6 +28,14 @@ METRIC_COLUMNS = [
     "colorfulness",
     "motion",
 ]
+AUTO_TRUST_THRESHOLD = 0.98
+SNAPSHOT_LABELS = [
+    "start_before",
+    "start",
+    "middle",
+    "end",
+    "end_after",
+]
 
 
 def parse_time(value: str) -> float:
@@ -52,8 +60,18 @@ def format_time(seconds: float) -> str:
     return f"{minutes}:{sec:02d}"
 
 
+def format_time_precise(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining = seconds - hours * 3600 - minutes * 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:06.3f}"
+    return f"{minutes}:{remaining:06.3f}"
+
+
 def safe_time_name(seconds: float) -> str:
-    return re.sub(r"[^0-9A-Za-z]+", "-", format_time(seconds)).strip("-")
+    return re.sub(r"[^0-9A-Za-z]+", "-", format_time_precise(seconds)).strip("-")
 
 
 def cv_imread(path: Path, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
@@ -180,9 +198,12 @@ def boundary_frames(
     start: float,
     end: float,
     sample_rate: float,
+    duration: float,
 ) -> list[tuple[float, float, float, float]]:
-    start = max(0.0, start)
-    end = max(start, end)
+    start = max(0.0, min(duration, start))
+    end = max(start, min(duration, end))
+    if end - start < 1.0 / sample_rate:
+        return []
     reader = imageio_ffmpeg.read_frames(
         str(video_path),
         pix_fmt="rgb24",
@@ -190,7 +211,7 @@ def boundary_frames(
     )
     try:
         meta = next(reader)
-    except StopIteration:
+    except (OSError, StopIteration):
         return []
 
     width, height = meta["size"]
@@ -220,8 +241,33 @@ def strongest_cut_time(rows: list[tuple[float, float, float, float]], center: fl
     return time_value
 
 
+def leading_cut_time(
+    rows: list[tuple[float, float, float, float]],
+    center: float,
+    radius: float,
+) -> Optional[float]:
+    candidates = [row for row in rows if center - radius <= row[0] <= center + radius and row[3] >= 0.14]
+    if not candidates:
+        return None
+    max_diff = max(row[3] for row in candidates)
+    strong = [row for row in candidates if row[3] >= max(0.14, max_diff * 0.72)]
+    return min(row[0] for row in strong)
+
+
 def dark_transition_end(rows: list[tuple[float, float, float, float]], center: float, sample_rate: float) -> Optional[float]:
     dark_times = [time_value for time_value, brightness, dark_ratio, _ in rows if time_value >= center - 1.0 and brightness < 0.16 and dark_ratio > 0.65]
+    if not dark_times:
+        return None
+    return max(dark_times) + 1.0 / sample_rate
+
+
+def any_dark_transition_end(
+    rows: list[tuple[float, float, float, float]],
+    lower: float,
+    upper: float,
+    sample_rate: float,
+) -> Optional[float]:
+    dark_times = [time_value for time_value, brightness, dark_ratio, _ in rows if lower <= time_value <= upper and brightness < 0.08 and dark_ratio > 0.9]
     if not dark_times:
         return None
     return max(dark_times) + 1.0 / sample_rate
@@ -245,29 +291,44 @@ def refine_detection_boundaries(
     video_path: Path,
     detections: list[dict],
     duration: float,
-    sample_rate: float = 8.0,
+    sample_rate: float = 24.0,
     radius: float = 2.5,
 ) -> list[dict]:
     refined: list[dict] = []
     for item in detections:
         result = item.copy()
-        if item["kind"] not in {"template_match", "template_library"} or float(item["end"]) <= float(item["start"]):
+        if item["kind"] not in {"template_match", "template_library", "auto_discovery"} or float(item["end"]) <= float(item["start"]):
             refined.append(result)
             continue
 
         start = float(item["start"])
         end = float(item["end"])
-        start_rows = boundary_frames(video_path, start - radius, start + radius, sample_rate)
-        end_rows = boundary_frames(video_path, end - radius, end + radius, sample_rate)
+        start_radius = 4.0 if item["kind"] == "auto_discovery" else radius
+        end_radius = 6.0 if item["kind"] == "auto_discovery" else radius
+        start_rows = boundary_frames(video_path, start - start_radius, start + start_radius, sample_rate, duration)
+        end_rows = boundary_frames(video_path, end - end_radius, end + radius, sample_rate, duration)
 
-        refined_start = strongest_cut_time(start_rows, start, radius=1.5)
-        refined_end = trailing_cut_time(end_rows, end, radius=1.5, sample_rate=sample_rate) or dark_transition_end(end_rows, end, sample_rate) or strongest_cut_time(end_rows, end, radius=1.5)
+        if item["kind"] == "auto_discovery":
+            if start <= 1.0:
+                refined_start = start
+            else:
+                refined_start = leading_cut_time(start_rows, start, radius=start_radius) or strongest_cut_time(start_rows, start, radius=start_radius)
+            refined_end = (
+                any_dark_transition_end(end_rows, end - end_radius, end + radius, sample_rate)
+                or trailing_cut_time(end_rows, end, radius=end_radius, sample_rate=sample_rate)
+                or strongest_cut_time(end_rows, end, radius=end_radius)
+            )
+            if duration - end <= 8.0:
+                refined_end = duration
+        else:
+            refined_start = leading_cut_time(start_rows, start, radius=1.5) or strongest_cut_time(start_rows, start, radius=1.5)
+            refined_end = dark_transition_end(end_rows, end, sample_rate) or trailing_cut_time(end_rows, end, radius=1.5, sample_rate=sample_rate) or strongest_cut_time(end_rows, end, radius=1.5)
 
         notes = []
-        if refined_start is not None and abs(refined_start - start) <= radius:
+        if refined_start is not None and abs(refined_start - start) <= start_radius:
             result["start"] = max(0.0, min(duration, refined_start))
             notes.append(f"start_refined={start:.3f}->{result['start']:.3f}")
-        if refined_end is not None and abs(refined_end - end) <= radius:
+        if refined_end is not None and (abs(refined_end - end) <= end_radius or abs(refined_end - duration) < 1e-6):
             result["end"] = max(float(result["start"]), min(duration, refined_end))
             notes.append(f"end_refined={end:.3f}->{result['end']:.3f}")
         if notes:
@@ -668,6 +729,8 @@ def combine_detections(detections: list[dict], merge_gap: float) -> list[dict]:
 
 def snapshot_targets(detections: list[dict], duration: float) -> list[dict]:
     targets: list[dict] = []
+    adjacent_frame_step = 1.0 / 24.0
+    max_snapshot_time = max(0.0, duration - 0.5)
     for index, item in enumerate(detections, start=1):
         start = float(item["start"])
         end = float(item["end"])
@@ -676,16 +739,16 @@ def snapshot_targets(detections: list[dict], duration: float) -> list[dict]:
             continue
 
         span = end - start
-        inside_offset = min(0.5, max(0.0, span / 4))
-        end_inside = min(duration, max(start, end - inside_offset))
         mid = start + span / 2
         points = [
-            ("start", min(duration, start + inside_offset)),
-            ("middle", min(duration, mid)),
-            ("end", end_inside),
+            ("start_before", max(0.0, start - adjacent_frame_step), False),
+            ("start", min(max_snapshot_time, start), False),
+            ("middle", min(max_snapshot_time, mid), False),
+            ("end", min(max_snapshot_time, max(start, end - adjacent_frame_step)), False),
+            ("end_after", min(max_snapshot_time, end + adjacent_frame_step), end >= duration - 0.5),
         ]
-        for label, point_time in points:
-            targets.append({"detection": index, "label": label, "time": point_time})
+        for label, point_time, is_placeholder in points:
+            targets.append({"detection": index, "label": label, "time": point_time, "placeholder": is_placeholder})
     return sorted(targets, key=lambda item: item["time"])
 
 
@@ -719,6 +782,9 @@ def extract_snapshots(
     for target in targets:
         detection_index = target["detection"]
         label = target["label"]
+        if target.get("placeholder"):
+            snapshots.setdefault(detection_index, {})[label] = "__VIDEO_END__"
+            continue
         target_time = float(target["time"])
         filename = f"{detection_index:02d}_{label}_{safe_time_name(target_time)}.jpg"
         path = snapshot_dir / filename
@@ -741,19 +807,21 @@ def extract_snapshots(
             str(raw_path),
         ]
         subprocess.run(command, check=True)
+        if not raw_path.exists():
+            continue
         frame = cv_imread(raw_path)
         raw_path.unlink(missing_ok=True)
         if frame is None:
             continue
 
-        display = overlay_label(frame, f"ad {detection_index} {label} {format_time(target_time)}")
+        display = overlay_label(frame, f"ad {detection_index} {label} {format_time_precise(target_time)}")
         cv_imwrite(path, display)
         report_path = path.relative_to(output_dir.parent)
         snapshots.setdefault(detection_index, {})[label] = report_path.as_posix()
         contact_frames.append(cv2.resize(display, (320, 180), interpolation=cv2.INTER_AREA))
 
     if write_contact_sheet and contact_frames:
-        columns = 3
+        columns = len(SNAPSHOT_LABELS)
         rows = []
         blank = np.zeros_like(contact_frames[0])
         for index in range(0, len(contact_frames), columns):
@@ -789,14 +857,17 @@ def write_outputs(
                 "kind",
                 "sources",
                 "review_required",
+                "start_before_frame",
                 "start_frame",
                 "middle_frame",
                 "end_frame",
+                "end_after_frame",
             ],
         )
         writer.writeheader()
         for index, item in enumerate(detections, start=1):
             item_snapshots = snapshots.get(index, {})
+            review_required = item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD
             writer.writerow(
                 {
                     "start": format_time(item["start"]),
@@ -806,10 +877,12 @@ def write_outputs(
                     "score": round(item["score"], 4),
                     "kind": item["kind"],
                     "sources": ";".join(item["sources"]),
-                    "review_required": "yes" if item["kind"] == "auto_discovery" else "no",
+                    "review_required": "yes" if review_required else "no",
+                    "start_before_frame": item_snapshots.get("start_before", ""),
                     "start_frame": item_snapshots.get("start", ""),
                     "middle_frame": item_snapshots.get("middle", ""),
                     "end_frame": item_snapshots.get("end", ""),
+                    "end_after_frame": item_snapshots.get("end_after", ""),
                 }
             )
 

@@ -21,9 +21,19 @@ HEADERS = [
     "kind",
     "review_required",
     "sources",
+    "start_before_frame",
     "start_frame",
     "middle_frame",
     "end_frame",
+    "end_after_frame",
+]
+
+FRAME_COLUMNS = [
+    ("start_before_frame", "K"),
+    ("start_frame", "L"),
+    ("middle_frame", "M"),
+    ("end_frame", "N"),
+    ("end_after_frame", "O"),
 ]
 
 
@@ -65,8 +75,15 @@ def resolve_image_path(workbook_dir: Path, value: str) -> Path:
     return workbook_dir / path
 
 
-def add_image(ws, image_path: Path, cell: str, width: int, height: int) -> None:
-    if not image_path.exists():
+def add_image_or_label(ws, workbook_dir: Path, value: str, cell: str, width: int, height: int) -> None:
+    if value == "__VIDEO_END__":
+        target = ws[cell]
+        target.value = "视频结束"
+        target.alignment = Alignment(horizontal="center", vertical="center")
+        target.font = Font(color="666666")
+        return
+    image_path = resolve_image_path(workbook_dir, value)
+    if not image_path.is_file():
         return
     image = Image(str(image_path))
     image.width = width
@@ -118,6 +135,8 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
             "",
             "",
             "",
+            "",
+            "",
         ]
         for column, value in enumerate(values, start=1):
             cell = ws.cell(row=row_index, column=column, value=value)
@@ -125,13 +144,12 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
             cell.border = border
         dv.add(ws.cell(row=row_index, column=1))
 
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("start_frame", "")), f"K{row_index}", 180, 101)
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("middle_frame", "")), f"L{row_index}", 180, 101)
-        add_image(ws, resolve_image_path(output_dir.parent, row.get("end_frame", "")), f"M{row_index}", 180, 101)
+        for frame_name, column_letter in FRAME_COLUMNS:
+            add_image_or_label(ws, output_dir.parent, row.get(frame_name, ""), f"{column_letter}{row_index}", 180, 101)
         ws.row_dimensions[row_index].height = 84
 
     last_row = max(5, len(rows) + 4)
-    ws.auto_filter.ref = f"A4:M{last_row}"
+    ws.auto_filter.ref = f"A4:O{last_row}"
     ws.freeze_panes = "A5"
     ws.column_dimensions["A"].width = 10
     ws.column_dimensions["B"].width = 26
@@ -146,15 +164,17 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
     ws.column_dimensions["K"].width = 26
     ws.column_dimensions["L"].width = 26
     ws.column_dimensions["M"].width = 26
+    ws.column_dimensions["N"].width = 26
+    ws.column_dimensions["O"].width = 26
     ws.column_dimensions["E"].hidden = True
     ws.column_dimensions["F"].hidden = True
 
     ws.conditional_formatting.add(
-        f"A5:M{last_row}",
+        f"A5:O{last_row}",
         FormulaRule(formula=["$A5=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A5:M{last_row}",
+        f"A5:O{last_row}",
         FormulaRule(formula=["$I5=\"yes\""], fill=review_fill),
     )
 
@@ -174,7 +194,9 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
     summary.column_dimensions["B"].width = 16
 
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(xlsx_path)
+    tmp_path = xlsx_path.with_suffix(".tmp.xlsx")
+    wb.save(tmp_path)
+    tmp_path.replace(xlsx_path)
 
 
 def main() -> int:
