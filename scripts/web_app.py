@@ -27,6 +27,7 @@ REVIEW_XLSX = OUTPUT_DIR / "ad_review.xlsx"
 CLEANED_DIR = OUTPUT_DIR / "cleaned"
 DETECT_DIR = OUTPUT_DIR / "detect"
 FRAME_FIELDS = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"]
+DURATION_CACHE: dict[str, tuple[float, int, float | None]] = {}
 
 
 @dataclass
@@ -50,20 +51,104 @@ def rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
-def file_item(path: Path) -> dict:
+def read_uint32(data: bytes) -> int:
+    return int.from_bytes(data, "big", signed=False)
+
+
+def read_uint64(data: bytes) -> int:
+    return int.from_bytes(data, "big", signed=False)
+
+
+def iter_mp4_boxes(handle, end: int | None = None):
+    while True:
+        offset = handle.tell()
+        if end is not None and offset >= end:
+            return
+        header = handle.read(8)
+        if len(header) < 8:
+            return
+        size = read_uint32(header[:4])
+        box_type = header[4:8]
+        header_size = 8
+        if size == 1:
+            extended = handle.read(8)
+            if len(extended) < 8:
+                return
+            size = read_uint64(extended)
+            header_size = 16
+        elif size == 0:
+            if end is None:
+                handle.seek(0, 2)
+                size = handle.tell() - offset
+            else:
+                size = end - offset
+        if size < header_size:
+            return
+        yield offset, size, header_size, box_type
+        handle.seek(offset + size)
+
+
+def mp4_duration_from_metadata(path: Path) -> float | None:
+    try:
+        with path.open("rb") as handle:
+            for offset, size, header_size, box_type in iter_mp4_boxes(handle):
+                if box_type != b"moov":
+                    continue
+                moov_end = offset + size
+                handle.seek(offset + header_size)
+                for child_offset, child_size, child_header_size, child_type in iter_mp4_boxes(handle, moov_end):
+                    if child_type != b"mvhd":
+                        continue
+                    handle.seek(child_offset + child_header_size)
+                    payload = handle.read(32)
+                    if len(payload) < 20:
+                        return None
+                    version = payload[0]
+                    if version == 1:
+                        if len(payload) < 32:
+                            return None
+                        timescale = read_uint32(payload[20:24])
+                        duration = read_uint64(payload[24:32])
+                    else:
+                        timescale = read_uint32(payload[12:16])
+                        duration = read_uint32(payload[16:20])
+                    if timescale <= 0:
+                        return None
+                    return duration / timescale
+                return None
+    except OSError:
+        return None
+    return None
+
+
+def probe_video_duration(path: Path, stat: object) -> float | None:
+    cache_key = str(path.resolve())
+    cached = DURATION_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+
+    duration = mp4_duration_from_metadata(path)
+    DURATION_CACHE[cache_key] = (stat.st_mtime, stat.st_size, duration)
+    return duration
+
+
+def file_item(path: Path, include_duration: bool = False) -> dict:
     stat = path.stat()
-    return {
+    item = {
         "name": path.name,
         "path": rel(path),
         "size": stat.st_size,
         "mtime": stat.st_mtime,
     }
+    if include_duration and path.suffix.lower() == ".mp4":
+        item["duration"] = probe_video_duration(path, stat)
+    return item
 
 
-def list_files(directory: Path, pattern: str) -> list[dict]:
+def list_files(directory: Path, pattern: str, include_duration: bool = False) -> list[dict]:
     if not directory.exists():
         return []
-    return [file_item(path) for path in sorted(directory.glob(pattern)) if path.is_file()]
+    return [file_item(path, include_duration=include_duration) for path in sorted(directory.glob(pattern)) if path.is_file()]
 
 
 def valid_input_files(values: list[str]) -> list[str]:
@@ -82,9 +167,9 @@ def safe_cleaned_file(value: str) -> Path | None:
 def snapshot() -> dict:
     return {
         "job": job_snapshot(),
-        "inputs": list_files(INPUT_DIR, "*.mp4"),
+        "inputs": list_files(INPUT_DIR, "*.mp4", include_duration=True),
         "review": file_item(REVIEW_XLSX) if REVIEW_XLSX.exists() else None,
-        "cleaned": list_files(CLEANED_DIR, "*.mp4"),
+        "cleaned": list_files(CLEANED_DIR, "*.mp4", include_duration=True),
     }
 
 
@@ -449,6 +534,29 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.25;
       vertical-align: middle;
     }
+    .file-cell-content {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    button.file-toggle {
+      flex: 0 0 auto;
+      width: 18px;
+      height: 18px;
+      padding: 0;
+      font-size: 12px;
+      line-height: 16px;
+      background: #fff;
+      color: var(--text);
+      border-color: var(--line);
+      font-weight: 700;
+    }
+    td.collapsed-summary {
+      text-align: left;
+      color: var(--muted);
+      background: #fafafa;
+    }
     td.compact, th.compact { white-space: nowrap; width: 1%; }
     select.review-decision { width: 64px; padding: 0 6px; }
     th { color: var(--muted); font-weight: 600; font-size: 12px; }
@@ -623,6 +731,7 @@ INDEX_HTML = r"""<!doctype html>
     let reviewSaveTimer = null;
     let reviewSaveInFlight = false;
     let reviewTableScroll = {left: 0, top: 0};
+    let collapsedReviewFiles = new Set();
     let selectedInputs = new Set();
     let selectedCleaned = new Set();
     let initializedInputSelection = false;
@@ -641,9 +750,18 @@ INDEX_HTML = r"""<!doctype html>
       if (bytes > 1024) return (bytes / 1024).toFixed(1) + " KB";
       return bytes + " B";
     }
+    function durationText(seconds) {
+      if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+      const rounded = Math.round(seconds);
+      const hours = Math.floor(rounded / 3600);
+      const minutes = Math.floor((rounded % 3600) / 60);
+      const secs = rounded % 60;
+      if (hours) return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+      return `${minutes}:${String(secs).padStart(2, "0")}`;
+    }
     function fileLink(item) {
       const href = "/files/" + encodeURIComponent(item.path);
-      return `<a href="${href}">${escapeHtml(item.name)}</a> <span class="muted">${sizeText(item.size)}</span>`;
+      return `<a href="${href}">${escapeHtml(item.name)}</a>`;
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -704,8 +822,8 @@ INDEX_HTML = r"""<!doctype html>
       }
       const selected = kind === "input" ? selectedInputs : selectedCleaned;
       const allChecked = files.length > 0 && files.every(item => selected.has(item.name));
-      el.innerHTML = `<table><thead><tr><th class="compact"><input type="checkbox" ${allChecked ? "checked" : ""} onchange="setAllSelection('${kind}', this.checked)"></th><th>文件</th><th class="compact">大小</th></tr></thead><tbody>${files.map((item, index) =>
-        `<tr><td class="compact"><input type="checkbox" ${selected.has(item.name) ? "checked" : ""} onchange="setSelectionByIndex('${kind}', ${index}, this.checked)"></td><td>${fileLink(item)}</td><td class="compact">${sizeText(item.size)}</td></tr>`
+      el.innerHTML = `<table><thead><tr><th class="compact"><input type="checkbox" ${allChecked ? "checked" : ""} onchange="setAllSelection('${kind}', this.checked)"></th><th>文件</th><th class="compact">大小</th><th class="compact">时长</th></tr></thead><tbody>${files.map((item, index) =>
+        `<tr><td class="compact"><input type="checkbox" ${selected.has(item.name) ? "checked" : ""} onchange="setSelectionByIndex('${kind}', ${index}, this.checked)"></td><td>${fileLink(item)}</td><td class="compact">${sizeText(item.size)}</td><td class="compact">${durationText(item.duration)}</td></tr>`
       ).join("")}</tbody></table>`;
     }
     function setReviewDirty(value, schedule = true) {
@@ -738,6 +856,14 @@ INDEX_HTML = r"""<!doctype html>
       wrap.scrollLeft = reviewTableScroll.left;
       wrap.scrollTop = reviewTableScroll.top;
       wrap.addEventListener("scroll", rememberReviewScroll, {passive: true});
+    }
+    function toggleReviewFile(file) {
+      if (collapsedReviewFiles.has(file)) {
+        collapsedReviewFiles.delete(file);
+      } else {
+        collapsedReviewFiles.add(file);
+      }
+      renderReviewRows(reviewRows, false);
     }
     function positionImagePreview(event) {
       if (imagePreviewEl.hidden) return;
@@ -789,7 +915,7 @@ INDEX_HTML = r"""<!doctype html>
       reviewStatusEl.textContent = "";
       updateSelectionButtons();
     }
-    function renderReviewRows(rows) {
+    function renderReviewRows(rows, resetDirty = true) {
       rememberReviewScroll();
       reviewRows = rows;
       if (!rows.length) {
@@ -798,35 +924,52 @@ INDEX_HTML = r"""<!doctype html>
         reviewTableScroll = {left: 0, top: 0};
         return;
       }
-      const fileSpans = rows.map((row, index) => {
-        if (index > 0 && rows[index - 1].file === row.file) return 0;
+      const bodyRows = [];
+      for (let index = 0; index < rows.length;) {
+        const file = rows[index].file;
+        const startIndex = index;
         let span = 1;
-        while (rows[index + span] && rows[index + span].file === row.file) span += 1;
-        return span;
-      });
+        while (rows[index + span] && rows[index + span].file === file) span += 1;
+        const collapsed = collapsedReviewFiles.has(file);
+        const toggleArgs = escapeHtml(JSON.stringify(file));
+        const fileCellContent = `<div class="file-cell-content"><button type="button" class="file-toggle" title="${collapsed ? "展开" : "收起"}" onclick="toggleReviewFile(${toggleArgs})">${collapsed ? "▾" : "▴"}</button><span>${escapeHtml(file)}</span></div>`;
+        if (collapsed) {
+          bodyRows.push(`<tr class="collapsed-file-row">
+            <td class="file" title="${escapeHtml(file)}">${fileCellContent}</td>
+            <td class="collapsed-summary" colspan="7">已收起 ${span} 条候选</td>
+          </tr>`);
+          index += span;
+          continue;
+        }
+
+        for (let offset = 0; offset < span; offset += 1) {
+          const rowIndex = startIndex + offset;
+          const row = rows[rowIndex];
+          const frames = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"].map(key => {
+            if (row[`${key}_label`]) return `<span class="frame-placeholder">${escapeHtml(row[`${key}_label`])}</span>`;
+            return row[`${key}_url`] ? `<a class="frame-link" href="${escapeHtml(row[`${key}_download_url`])}" data-preview="${escapeHtml(row[`${key}_url`])}"><img src="${escapeHtml(row[`${key}_url`])}" alt="${key}" loading="lazy"></a>` : '<span class="frame-placeholder">无截图</span>';
+          }).join("");
+          const fileCell = offset === 0 ? `<td class="file" rowspan="${span}" title="${escapeHtml(file)}">${fileCellContent}</td>` : "";
+          bodyRows.push(`<tr>
+            ${fileCell}
+            <td class="compact"><select class="review-decision" onchange="updateReviewRow(${rowIndex}, 'delete', this.value)">
+              <option value="YES" ${row.delete === "YES" ? "selected" : ""}>YES</option>
+              <option value="NO" ${row.delete !== "YES" ? "selected" : ""}>NO</option>
+            </select></td>
+            <td class="compact"><input class="time" value="${escapeHtml(row.start)}" oninput="updateReviewRow(${rowIndex}, 'start', this.value)"></td>
+            <td class="compact"><input class="time" value="${escapeHtml(row.end)}" oninput="updateReviewRow(${rowIndex}, 'end', this.value)"></td>
+            <td class="compact">${escapeHtml(row.score || "")}</td>
+            <td class="compact" title="${escapeHtml(row.kind || "")}">${escapeHtml(shortKind(row.kind))}</td>
+            <td class="compact">${row.review_required === "yes" ? '<span class="pill warn">需确认</span>' : '<span class="pill ok">可信</span>'}</td>
+            <td class="frames-cell"><div class="frame-strip">${frames}</div></td>
+          </tr>`);
+        }
+        index += span;
+      }
       reviewRowsEl.innerHTML = `<div class="table-wrap"><table class="review-table"><colgroup><col class="file-col"><col class="decision-col"><col class="time-col"><col class="time-col"><col class="score-col"><col class="kind-col"><col class="status-col"><col></colgroup><thead><tr>
         <th class="file-heading">文件</th><th class="compact">删除</th><th class="compact">开始</th><th class="compact">结束</th><th class="compact">分数</th><th class="compact">来源</th><th class="compact">状态</th><th class="frames-heading">截图</th>
-      </tr></thead><tbody>${rows.map((row, index) => {
-        const frames = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"].map(key => {
-          if (row[`${key}_label`]) return `<span class="frame-placeholder">${escapeHtml(row[`${key}_label`])}</span>`;
-          return row[`${key}_url`] ? `<a class="frame-link" href="${escapeHtml(row[`${key}_download_url`])}" data-preview="${escapeHtml(row[`${key}_url`])}"><img src="${escapeHtml(row[`${key}_url`])}" alt="${key}" loading="lazy"></a>` : '<span class="frame-placeholder">无截图</span>';
-        }).join("");
-        const fileCell = fileSpans[index] ? `<td class="file" rowspan="${fileSpans[index]}" title="${escapeHtml(row.file)}">${escapeHtml(row.file)}</td>` : "";
-        return `<tr>
-          ${fileCell}
-          <td class="compact"><select class="review-decision" onchange="updateReviewRow(${index}, 'delete', this.value)">
-            <option value="YES" ${row.delete === "YES" ? "selected" : ""}>YES</option>
-            <option value="NO" ${row.delete !== "YES" ? "selected" : ""}>NO</option>
-          </select></td>
-          <td class="compact"><input class="time" value="${escapeHtml(row.start)}" oninput="updateReviewRow(${index}, 'start', this.value)"></td>
-          <td class="compact"><input class="time" value="${escapeHtml(row.end)}" oninput="updateReviewRow(${index}, 'end', this.value)"></td>
-          <td class="compact">${escapeHtml(row.score || "")}</td>
-          <td class="compact" title="${escapeHtml(row.kind || "")}">${escapeHtml(shortKind(row.kind))}</td>
-          <td class="compact">${row.review_required === "yes" ? '<span class="pill warn">需确认</span>' : '<span class="pill ok">可信</span>'}</td>
-          <td class="frames-cell"><div class="frame-strip">${frames}</div></td>
-        </tr>`;
-      }).join("")}</tbody></table></div>`;
-      setReviewDirty(false, false);
+      </tr></thead><tbody>${bodyRows.join("")}</tbody></table></div>`;
+      if (resetDirty) setReviewDirty(false, false);
       restoreReviewScroll();
     }
     reviewRowsEl.addEventListener("mouseover", event => {
