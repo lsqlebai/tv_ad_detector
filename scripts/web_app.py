@@ -41,6 +41,9 @@ class JobState:
 
 JOB = JobState()
 JOB_LOCK = threading.Lock()
+EVENT_CONDITION = threading.Condition()
+EVENT_ID = 0
+EVENTS: list[dict] = []
 
 
 def rel(path: Path) -> str:
@@ -104,6 +107,16 @@ def append_log(line: str) -> None:
             del JOB.log[: len(JOB.log) - 1000]
 
 
+def publish_event(event_type: str, payload: dict | None = None) -> None:
+    global EVENT_ID
+    with EVENT_CONDITION:
+        EVENT_ID += 1
+        EVENTS.append({"id": EVENT_ID, "type": event_type, "payload": payload or {}})
+        if len(EVENTS) > 200:
+            del EVENTS[: len(EVENTS) - 200]
+        EVENT_CONDITION.notify_all()
+
+
 def clear_review_outputs() -> None:
     REVIEW_XLSX.unlink(missing_ok=True)
     REVIEW_XLSX.with_suffix(".tmp.xlsx").unlink(missing_ok=True)
@@ -132,6 +145,8 @@ def run_job(name: str, command: list[str]) -> None:
         assert process.stdout is not None
         for line in process.stdout:
             append_log(line)
+            if "Appended " in line and "review workbook" in line:
+                publish_event("review-updated", {})
         returncode = process.wait()
     except Exception as exc:  # pragma: no cover - surfaced in the UI log.
         append_log(f"ERROR: {exc}")
@@ -142,6 +157,7 @@ def run_job(name: str, command: list[str]) -> None:
         JOB.finished_at = time.time()
         JOB.returncode = returncode
         JOB.log.append(f"Finished with exit code {returncode}")
+    publish_event("job-finished", {"name": name, "returncode": returncode})
 
 
 def start_job(name: str, command: list[str]) -> tuple[bool, str]:
@@ -818,6 +834,15 @@ INDEX_HTML = r"""<!doctype html>
       const data = await response.json();
       renderReviewRows(data.rows || []);
     }
+    async function refreshReviewOnly() {
+      const data = await fetch("/api/status").then(r => r.json());
+      if (data.review) {
+        document.getElementById("review").innerHTML = fileLink(data.review);
+        currentHasReview = true;
+        updateSelectionButtons();
+        await loadReviewRows(false);
+      }
+    }
     function updateJobStatus(data) {
       const running = data.job.running;
       currentRunning = running;
@@ -960,7 +985,18 @@ INDEX_HTML = r"""<!doctype html>
       }
       setTimeout(() => { copyStatusEl.textContent = ""; }, 1800);
     }
+    function connectEvents() {
+      if (!window.EventSource) return;
+      const source = new EventSource("/api/events");
+      source.addEventListener("review-updated", () => {
+        refreshReviewOnly();
+      });
+      source.addEventListener("job-finished", () => {
+        refreshPageData({files: true, review: false});
+      });
+    }
     refreshPageData({files: true, review: true});
+    connectEvents();
     setInterval(pollJob, 2500);
   </script>
 </body>
@@ -970,6 +1006,7 @@ INDEX_HTML = r"""<!doctype html>
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TVAdDetector/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -999,6 +1036,35 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if parsed.path == "/api/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                last_id = int(self.headers.get("Last-Event-ID", "0") or "0")
+            except ValueError:
+                last_id = 0
+            try:
+                while True:
+                    with EVENT_CONDITION:
+                        pending = [event for event in EVENTS if event["id"] > last_id]
+                        if not pending:
+                            EVENT_CONDITION.wait(timeout=15)
+                            pending = [event for event in EVENTS if event["id"] > last_id]
+                    if not pending:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        continue
+                    for event in pending:
+                        body = json.dumps(event["payload"], ensure_ascii=False)
+                        payload = f"id: {event['id']}\nevent: {event['type']}\ndata: {body}\n\n".encode("utf-8")
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                        last_id = int(event["id"])
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                return
         if parsed.path == "/api/status":
             self.send_json(snapshot())
             return

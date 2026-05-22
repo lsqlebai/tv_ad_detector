@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import re
 import shlex
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -34,9 +37,23 @@ def format_range(start: float, end: float) -> str:
     return f"{format_time(start)}-{format_time(end)} ({end - start:.3f}s)"
 
 
-def ffprobe_duration(ffmpeg: str, video_path: Path) -> float:
-    _, seconds = imageio_ffmpeg.count_frames_and_secs(str(video_path))
-    return float(seconds)
+def probe_duration(ffmpeg: str, video_path: Path) -> float:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(video_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    output = result.stderr + result.stdout
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    if not match:
+        _, seconds = imageio_ffmpeg.count_frames_and_secs(str(video_path))
+        duration = float(seconds)
+    else:
+        hours, minutes, seconds = match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return duration
 
 
 def read_ad_ranges(path: Path, duration: float) -> list[tuple[float, float]]:
@@ -228,7 +245,8 @@ def process_video(
     review_ranges: Optional[dict[str, list[tuple[float, float]]]] = None,
 ) -> None:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    duration = ffprobe_duration(ffmpeg, video_path)
+    started = time.perf_counter()
+    duration = probe_duration(ffmpeg, video_path)
     if review_ranges is None:
         ad_path = ads_dir / f"{video_path.stem}.ads.txt"
         ads = read_ad_ranges(ad_path, duration)
@@ -260,11 +278,26 @@ def process_video(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     segments: list[Path] = []
     try:
+        jobs = min(2, len(keeps)) if mode == "reencode" else 1
+        segment_specs = []
         for index, (start, end) in enumerate(keeps, start=1):
             segment_path = tmp_dir / f"{index:03d}.mp4"
-            print(f"{video_path.name}: cutting segment {index}/{len(keeps)} -> {segment_path.name}", flush=True)
-            cut_segment(ffmpeg, video_path, segment_path, start, end, mode)
+            segment_specs.append((index, start, end, segment_path))
             segments.append(segment_path)
+        if jobs > 1:
+            print(f"{video_path.name}: cutting {len(keeps)} segment(s) with {jobs} parallel job(s)", flush=True)
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = {}
+                for index, start, end, segment_path in segment_specs:
+                    print(f"{video_path.name}: cutting segment {index}/{len(keeps)} -> {segment_path.name}", flush=True)
+                    future = executor.submit(cut_segment, ffmpeg, video_path, segment_path, start, end, mode)
+                    futures[future] = index
+                for future in as_completed(futures):
+                    future.result()
+        else:
+            for index, start, end, segment_path in segment_specs:
+                print(f"{video_path.name}: cutting segment {index}/{len(keeps)} -> {segment_path.name}", flush=True)
+                cut_segment(ffmpeg, video_path, segment_path, start, end, mode)
         print(f"{video_path.name}: concatenating {len(segments)} segment(s) -> {output_path}", flush=True)
         concat_segments(ffmpeg, segments, output_path)
     finally:
@@ -276,6 +309,7 @@ def process_video(
             pass
 
     if output_path.exists():
+        print(f"{video_path.name}: segmented cut completed in {time.perf_counter() - started:.1f}s", flush=True)
         print(f"{video_path.name}: removed {len(ads)} ad range(s), wrote {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)", flush=True)
     else:
         print(f"{video_path.name}: removed {len(ads)} ad range(s), but output file is missing: {output_path}", flush=True)

@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,7 @@ METRIC_COLUMNS = [
     "motion",
 ]
 AUTO_TRUST_THRESHOLD = 0.98
+MIN_BOUNDARY_FRAME_DIFF = 0.025
 SNAPSHOT_LABELS = [
     "start_before",
     "start",
@@ -207,7 +209,8 @@ def boundary_frames(
     reader = imageio_ffmpeg.read_frames(
         str(video_path),
         pix_fmt="rgb24",
-        output_params=["-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-vf", f"fps={sample_rate},scale=320:-2"],
+        input_params=["-ss", f"{start:.3f}"],
+        output_params=["-t", f"{end - start:.3f}", "-vf", f"fps={sample_rate},scale=320:-2"],
     )
     try:
         meta = next(reader)
@@ -287,6 +290,25 @@ def trailing_cut_time(
     return max(row[0] for row in strong) + 1.0 / sample_rate
 
 
+def boundary_has_cut(rows: list[tuple[float, float, float, float]], center: float, radius: float = 0.2) -> bool:
+    return any(abs(time_value - center) <= radius and diff >= 0.14 for time_value, _, _, diff in rows)
+
+
+def nearest_cut_time(
+    rows: list[tuple[float, float, float, float]],
+    center: float,
+    lower: float,
+    upper: float,
+) -> Optional[float]:
+    candidates = [row for row in rows if lower <= row[0] <= upper and row[3] >= 0.14]
+    if not candidates:
+        return None
+    max_diff = max(row[3] for row in candidates)
+    strong = [row for row in candidates if row[3] >= max(0.14, max_diff * 0.72)]
+    time_value, _, _, _ = min(strong, key=lambda row: abs(row[0] - center))
+    return time_value
+
+
 def refine_detection_boundaries(
     video_path: Path,
     detections: list[dict],
@@ -335,6 +357,49 @@ def refine_detection_boundaries(
             result["sources"] = sorted(set(result["sources"]) | set(notes))
         refined.append(result)
     return refined
+
+
+def repair_unclear_boundaries(
+    video_path: Path,
+    detections: list[dict],
+    duration: float,
+    sample_rate: float = 24.0,
+    search_radius: float = 8.0,
+) -> list[dict]:
+    repaired: list[dict] = []
+    for item in detections:
+        result = item.copy()
+        if item["kind"] not in {"template_match", "template_library", "auto_discovery"} or float(item["end"]) <= float(item["start"]):
+            repaired.append(result)
+            continue
+
+        start = float(item["start"])
+        end = float(item["end"])
+        notes: list[str] = []
+
+        if start > 0.5:
+            start_rows = boundary_frames(video_path, start - search_radius, start + search_radius, sample_rate, duration)
+            if not boundary_has_cut(start_rows, start):
+                repaired_start = nearest_cut_time(start_rows, start, max(0.0, start - search_radius), min(duration, start + search_radius))
+                if repaired_start is not None and abs(repaired_start - start) > 1.0 / sample_rate and repaired_start < end:
+                    result["start"] = max(0.0, min(duration, repaired_start))
+                    notes.append(f"start_boundary_repaired={start:.3f}->{result['start']:.3f}")
+
+        current_start = float(result["start"])
+        if duration - end > 0.5:
+            end_rows = boundary_frames(video_path, end - search_radius, end + search_radius, sample_rate, duration)
+            if not boundary_has_cut(end_rows, end):
+                repaired_end = nearest_cut_time(end_rows, end, max(0.0, end - search_radius), min(duration, end + search_radius))
+                if repaired_end is not None:
+                    repaired_end = min(duration, repaired_end + 1.0 / sample_rate)
+                if repaired_end is not None and abs(repaired_end - end) > 1.0 / sample_rate and repaired_end > current_start:
+                    result["end"] = max(current_start, min(duration, repaired_end))
+                    notes.append(f"end_boundary_repaired={end:.3f}->{result['end']:.3f}")
+
+        if notes:
+            result["sources"] = sorted(set(result["sources"]) | set(notes))
+        repaired.append(result)
+    return repaired
 
 
 def cosine_window_scores(features: np.ndarray, template: np.ndarray) -> np.ndarray:
@@ -759,16 +824,66 @@ def overlay_label(frame: np.ndarray, text: str) -> np.ndarray:
     return image
 
 
+def frame_diff_score(left: np.ndarray, right: np.ndarray) -> float:
+    left_gray = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+    right_gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+    if left_gray.shape != right_gray.shape:
+        right_gray = cv2.resize(right_gray, (left_gray.shape[1], left_gray.shape[0]), interpolation=cv2.INTER_AREA)
+    left_small = cv2.resize(left_gray, (160, 90), interpolation=cv2.INTER_AREA)
+    right_small = cv2.resize(right_gray, (160, 90), interpolation=cv2.INTER_AREA)
+    return float(np.mean(cv2.absdiff(left_small, right_small)) / 255.0)
+
+
+def extract_raw_snapshots(
+    ffmpeg: str,
+    video_path: Path,
+    items: list[tuple[float, Path]],
+) -> None:
+    if not items:
+        return
+
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    for target_time, _ in items:
+        command.extend(["-ss", f"{target_time:.3f}", "-i", str(video_path)])
+    for index, (_, raw_path) in enumerate(items):
+        command.extend(["-map", f"{index}:v:0", "-frames:v", "1", "-q:v", "2", "-y", str(raw_path)])
+
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError:
+        for target_time, raw_path in items:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-ss",
+                    f"{target_time:.3f}",
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    "-y",
+                    str(raw_path),
+                ],
+                check=True,
+            )
+
+
 def extract_snapshots(
     video_path: Path,
     detections: list[dict],
     duration: float,
     output_dir: Path,
     write_contact_sheet: bool,
-) -> dict[int, dict[str, str]]:
+) -> tuple[dict[int, dict[str, str]], dict[int, list[str]]]:
     targets = snapshot_targets(detections, duration)
     if not targets:
-        return {}
+        return {}, {}
 
     snapshot_dir = output_dir / f"{video_path.stem}.ad_frames"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -776,8 +891,11 @@ def extract_snapshots(
         old_file.unlink()
 
     snapshots: dict[int, dict[str, str]] = {}
+    raw_frames: dict[int, dict[str, np.ndarray]] = {}
+    raw_times: dict[int, dict[str, float]] = {}
     contact_frames: list[np.ndarray] = []
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    pending: list[tuple[dict, float, Path, Path]] = []
 
     for target in targets:
         detection_index = target["detection"]
@@ -789,30 +907,21 @@ def extract_snapshots(
         filename = f"{detection_index:02d}_{label}_{safe_time_name(target_time)}.jpg"
         path = snapshot_dir / filename
         raw_path = snapshot_dir / f".{filename}.raw.jpg"
+        pending.append((target, target_time, path, raw_path))
 
-        command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(video_path),
-            "-ss",
-            f"{target_time:.3f}",
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            "-y",
-            str(raw_path),
-        ]
-        subprocess.run(command, check=True)
+    extract_raw_snapshots(ffmpeg, video_path, [(target_time, raw_path) for _, target_time, _, raw_path in pending])
+
+    for target, target_time, path, raw_path in pending:
+        detection_index = target["detection"]
+        label = target["label"]
         if not raw_path.exists():
             continue
         frame = cv_imread(raw_path)
         raw_path.unlink(missing_ok=True)
         if frame is None:
             continue
+        raw_frames.setdefault(detection_index, {})[label] = frame
+        raw_times.setdefault(detection_index, {})[label] = target_time
 
         display = overlay_label(frame, f"ad {detection_index} {label} {format_time_precise(target_time)}")
         cv_imwrite(path, display)
@@ -831,7 +940,24 @@ def extract_snapshots(
             rows.append(np.hstack(row))
         cv_imwrite(output_dir / f"{video_path.stem}.ads.keyframes.jpg", np.vstack(rows))
 
-    return snapshots
+    boundary_notes: dict[int, list[str]] = {}
+    for detection_index, frames in raw_frames.items():
+        times = raw_times.get(detection_index, {})
+        for side, left_label, right_label in (
+            ("start", "start_before", "start"),
+            ("end", "end", "end_after"),
+        ):
+            left_frame = frames.get(left_label)
+            right_frame = frames.get(right_label)
+            if left_frame is None or right_frame is None:
+                continue
+            if abs(float(times.get(left_label, 0.0)) - float(times.get(right_label, 0.0))) < 1e-4:
+                continue
+            score = frame_diff_score(left_frame, right_frame)
+            if score < MIN_BOUNDARY_FRAME_DIFF:
+                boundary_notes.setdefault(detection_index, []).append(f"{side}_boundary_similar={score:.3f}")
+
+    return snapshots, boundary_notes
 
 
 def write_outputs(
@@ -843,7 +969,7 @@ def write_outputs(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = video_path.stem
-    snapshots = extract_snapshots(video_path, detections, duration, output_dir, write_debug_files)
+    snapshots, boundary_notes = extract_snapshots(video_path, detections, duration, output_dir, write_debug_files)
 
     with (output_dir / f"{stem}.ads.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -867,7 +993,9 @@ def write_outputs(
         writer.writeheader()
         for index, item in enumerate(detections, start=1):
             item_snapshots = snapshots.get(index, {})
-            review_required = item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD
+            boundary_review_notes = boundary_notes.get(index, [])
+            review_required = (item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD) or bool(boundary_review_notes)
+            sources = sorted(set(item["sources"]) | set(boundary_review_notes))
             writer.writerow(
                 {
                     "start": format_time(item["start"]),
@@ -876,7 +1004,7 @@ def write_outputs(
                     "end_seconds": round(item["end"], 3) if item["end"] > item["start"] else "",
                     "score": round(item["score"], 4),
                     "kind": item["kind"],
-                    "sources": ";".join(item["sources"]),
+                    "sources": ";".join(sources),
                     "review_required": "yes" if review_required else "no",
                     "start_before_frame": item_snapshots.get("start_before", ""),
                     "start_frame": item_snapshots.get("start", ""),
@@ -950,11 +1078,15 @@ def main() -> int:
         raise SystemExit(f"No .mp4 files found in {args.input_dir}")
 
     for video_path in videos:
+        video_started = time.perf_counter()
         print(f"Sampling {video_path.name}...")
+        stage_started = time.perf_counter()
         times, features, metrics, duration = sample_video(video_path, args.sample_rate)
+        print(f"  sampled {len(times)} frames in {time.perf_counter() - stage_started:.1f}s")
         keypoint_templates = build_templates_from_keypoints(times, features, keypoints, duration)
         save_templates(template_dir, video_path, keypoint_templates)
 
+        stage_started = time.perf_counter()
         detections = detect_from_templates(times, features, keypoints, args.threshold, args.min_gap, duration)
         library_templates = load_templates(template_dir)
         if library_templates:
@@ -967,7 +1099,9 @@ def main() -> int:
                     args.min_gap,
                 )
             )
+        print(f"  matched templates in {time.perf_counter() - stage_started:.1f}s")
         if not args.no_auto_discover:
+            stage_started = time.perf_counter()
             detections.extend(
                 discover_ad_candidates(
                     times,
@@ -979,16 +1113,23 @@ def main() -> int:
                     args.max_auto_candidates,
                 )
             )
+            print(f"  discovered candidates in {time.perf_counter() - stage_started:.1f}s")
         detections = combine_detections(detections, merge_gap=args.min_gap)
         if not args.no_refine_boundaries:
+            stage_started = time.perf_counter()
             detections = refine_detection_boundaries(video_path, detections, duration)
+            detections = repair_unclear_boundaries(video_path, detections, duration)
+            print(f"  refined boundaries in {time.perf_counter() - stage_started:.1f}s")
+        stage_started = time.perf_counter()
         write_outputs(args.output_dir, video_path, detections, duration, args.write_debug_files)
+        print(f"  wrote review assets in {time.perf_counter() - stage_started:.1f}s")
         print(f"{video_path.name}:")
         for item in detections:
             if item["end"] <= item["start"]:
                 print(f"  {format_time(item['start'])}-  {item['kind']} score={item['score']:.3f}")
             else:
                 print(f"  {format_time(item['start'])}-{format_time(item['end'])}  {item['kind']} score={item['score']:.3f}")
+        print(f"  total {time.perf_counter() - video_started:.1f}s")
 
     return 0
 
