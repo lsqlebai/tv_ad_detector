@@ -294,19 +294,100 @@ def boundary_has_cut(rows: list[tuple[float, float, float, float]], center: floa
     return any(abs(time_value - center) <= radius and diff >= 0.14 for time_value, _, _, diff in rows)
 
 
+def strong_cut_candidates(
+    rows: list[tuple[float, float, float, float]],
+    lower: float,
+    upper: float,
+) -> list[tuple[float, float, float, float]]:
+    candidates = [row for row in rows if lower <= row[0] <= upper and row[3] >= 0.14]
+    if not candidates:
+        return []
+    max_diff = max(row[3] for row in candidates)
+    threshold = max(0.14, max_diff * 0.72)
+    return [row for row in candidates if row[3] >= threshold]
+
+
 def nearest_cut_time(
     rows: list[tuple[float, float, float, float]],
     center: float,
     lower: float,
     upper: float,
 ) -> Optional[float]:
-    candidates = [row for row in rows if lower <= row[0] <= upper and row[3] >= 0.14]
-    if not candidates:
+    strong = strong_cut_candidates(rows, lower, upper)
+    if not strong:
         return None
-    max_diff = max(row[3] for row in candidates)
-    strong = [row for row in candidates if row[3] >= max(0.14, max_diff * 0.72)]
     time_value, _, _, _ = min(strong, key=lambda row: abs(row[0] - center))
     return time_value
+
+
+def watermark_edge_density(frame: np.ndarray) -> float:
+    height, width = frame.shape[:2]
+    roi = frame[int(height * 0.02) : int(height * 0.10), int(width * 0.78) : int(width * 0.99)]
+    if roi.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return float(np.count_nonzero(cv2.Canny(gray, 80, 160)) / gray.size)
+
+
+def lower_caption_metrics(frame: np.ndarray) -> tuple[float, float]:
+    height, width = frame.shape[:2]
+    roi = frame[int(height * 0.78) : int(height * 0.92), int(width * 0.25) : int(width * 0.75)]
+    if roi.size == 0:
+        return 0.0, 0.0
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    edge_density = float(np.count_nonzero(cv2.Canny(gray, 80, 160)) / gray.size)
+    white_density = float(np.count_nonzero((gray > 185) & (hsv[:, :, 1] < 90)) / gray.size)
+    return edge_density, white_density
+
+
+def frame_looks_like_ad_entry(frame: np.ndarray) -> bool:
+    caption_edge, caption_white = lower_caption_metrics(frame)
+    return watermark_edge_density(frame) < 0.05 and (caption_edge < 0.07 or caption_white > 0.2)
+
+
+def choose_start_repair_cut(video_path: Path, candidates: list[tuple[float, float, float, float]]) -> Optional[float]:
+    if not candidates:
+        return None
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    sample_step = 1.0 / 24.0
+    temp_dir = Path("/tmp/tv_ad_detector_boundary_frames")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    frame_items: list[tuple[float, Path]] = []
+    candidate_paths: dict[float, tuple[Path, Path, Path]] = {}
+    for index, (time_value, _, _, _) in enumerate(candidates):
+        before_path = temp_dir / f"candidate_{index:02d}_before.jpg"
+        current_path = temp_dir / f"candidate_{index:02d}_current.jpg"
+        after_path = temp_dir / f"candidate_{index:02d}_after.jpg"
+        candidate_paths[time_value] = (before_path, current_path, after_path)
+        frame_items.append((max(0.0, time_value - sample_step), before_path))
+        frame_items.append((time_value, current_path))
+        frame_items.append((time_value + sample_step, after_path))
+
+    extract_raw_snapshots(ffmpeg, video_path, frame_items)
+    try:
+        for time_value, _, _, _ in sorted(candidates, key=lambda row: row[0]):
+            before_path, current_path, after_path = candidate_paths[time_value]
+            before_frame = cv_imread(before_path)
+            current_frame = cv_imread(current_path)
+            after_frame = cv_imread(after_path)
+            if before_frame is None or current_frame is None or after_frame is None:
+                continue
+            before_watermark = watermark_edge_density(before_frame)
+            current_watermark = watermark_edge_density(current_frame)
+            after_watermark = watermark_edge_density(after_frame)
+            if current_watermark < 0.05 and before_watermark > current_watermark + 0.02 and frame_looks_like_ad_entry(current_frame):
+                return time_value
+            if after_watermark < 0.05 and before_watermark > after_watermark + 0.02 and frame_looks_like_ad_entry(after_frame):
+                return time_value + sample_step
+    finally:
+        for before_path, current_path, after_path in candidate_paths.values():
+            before_path.unlink(missing_ok=True)
+            current_path.unlink(missing_ok=True)
+            after_path.unlink(missing_ok=True)
+
+    return min(candidates, key=lambda row: row[0])[0]
 
 
 def refine_detection_boundaries(
@@ -960,6 +1041,65 @@ def extract_snapshots(
     return snapshots, boundary_notes
 
 
+def repair_snapshot_similar_boundaries(
+    video_path: Path,
+    detections: list[dict],
+    duration: float,
+    output_dir: Path,
+    write_debug_files: bool,
+    sample_rate: float = 24.0,
+    search_radius: float = 10.0,
+) -> list[dict]:
+    repaired = [item.copy() for item in detections]
+    for _ in range(3):
+        _, boundary_notes = extract_snapshots(video_path, repaired, duration, output_dir, write_debug_files)
+        if not boundary_notes:
+            break
+
+        changed = False
+        for index, notes in boundary_notes.items():
+            item_index = index - 1
+            if item_index < 0 or item_index >= len(repaired):
+                continue
+            item = repaired[item_index]
+            if item["kind"] not in {"template_match", "template_library", "auto_discovery"} or float(item["end"]) <= float(item["start"]):
+                continue
+
+            note_set = set(notes)
+            item_notes: list[str] = []
+            start = float(item["start"])
+            end = float(item["end"])
+
+            if start > 0.5 and any(note.startswith("start_boundary_similar=") for note in note_set):
+                start_rows = boundary_frames(video_path, start, min(duration, start + search_radius), sample_rate, duration)
+                candidates = strong_cut_candidates(start_rows, start + 0.5, min(duration, end - 0.5, start + search_radius))
+                repaired_start = choose_start_repair_cut(video_path, candidates)
+                if repaired_start is not None and repaired_start < end and abs(repaired_start - start) > 1.0 / sample_rate:
+                    item["start"] = max(0.0, min(duration, repaired_start))
+                    item_notes.append(f"start_boundary_repaired_by_similarity={start:.3f}->{item['start']:.3f}")
+                    changed = True
+
+            current_start = float(item["start"])
+            current_end = float(item["end"])
+            if duration - current_end > 0.5 and any(note.startswith("end_boundary_similar=") for note in note_set):
+                end_rows = boundary_frames(video_path, max(0.0, current_end - search_radius), min(duration, current_end + search_radius), sample_rate, duration)
+                repaired_end = nearest_cut_time(end_rows, current_end, max(current_start + 0.5, current_end - search_radius), min(duration, current_end + search_radius))
+                if repaired_end is not None:
+                    repaired_end = min(duration, repaired_end + 1.0 / sample_rate)
+                if repaired_end is not None and repaired_end > current_start and abs(repaired_end - current_end) > 1.0 / sample_rate:
+                    item["end"] = max(current_start, min(duration, repaired_end))
+                    item_notes.append(f"end_boundary_repaired_by_similarity={current_end:.3f}->{item['end']:.3f}")
+                    changed = True
+
+            if item_notes:
+                item["sources"] = sorted(set(item["sources"]) | set(item_notes))
+
+        if not changed:
+            break
+
+    return repaired
+
+
 def write_outputs(
     output_dir: Path,
     video_path: Path,
@@ -1119,6 +1259,7 @@ def main() -> int:
             stage_started = time.perf_counter()
             detections = refine_detection_boundaries(video_path, detections, duration)
             detections = repair_unclear_boundaries(video_path, detections, duration)
+            detections = repair_snapshot_similar_boundaries(video_path, detections, duration, args.output_dir, args.write_debug_files)
             print(f"  refined boundaries in {time.perf_counter() - stage_started:.1f}s")
         stage_started = time.perf_counter()
         write_outputs(args.output_dir, video_path, detections, duration, args.write_debug_files)

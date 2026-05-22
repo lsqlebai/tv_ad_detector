@@ -90,7 +90,7 @@ def snapshot() -> dict:
 
 def job_snapshot() -> dict:
     with JOB_LOCK:
-        return {
+        payload = {
             "running": JOB.running,
             "name": JOB.name,
             "started_at": JOB.started_at,
@@ -98,6 +98,9 @@ def job_snapshot() -> dict:
             "returncode": JOB.returncode,
             "log": JOB.log[-300:],
         }
+    with EVENT_CONDITION:
+        payload["event_id"] = EVENT_ID
+    return payload
 
 
 def append_log(line: str) -> None:
@@ -115,6 +118,19 @@ def publish_event(event_type: str, payload: dict | None = None) -> None:
         if len(EVENTS) > 200:
             del EVENTS[: len(EVENTS) - 200]
         EVENT_CONDITION.notify_all()
+
+
+def wait_events(since: int, timeout: float = 25.0) -> tuple[int, list[dict]]:
+    deadline = time.time() + timeout
+    with EVENT_CONDITION:
+        while True:
+            events = [event for event in EVENTS if event["id"] > since]
+            if events:
+                return EVENT_ID, events
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return EVENT_ID, []
+            EVENT_CONDITION.wait(timeout=remaining)
 
 
 def clear_review_outputs() -> None:
@@ -614,6 +630,10 @@ INDEX_HTML = r"""<!doctype html>
     let lastJobName = "";
     let imagePreviewTimer = null;
     let imagePreviewAnchor = null;
+    let latestEventId = 0;
+    let reviewUpdateCursor = 0;
+    let reviewLongPollActive = false;
+    let reviewLongPollController = null;
 
     function sizeText(bytes) {
       if (bytes > 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
@@ -867,8 +887,10 @@ INDEX_HTML = r"""<!doctype html>
     async function refreshPageData(options = {}) {
       const data = await fetch("/api/status").then(r => r.json());
       updateJobStatus(data);
+      latestEventId = Math.max(latestEventId, data.job.event_id || 0);
       lastJobRunning = data.job.running;
       lastJobName = data.job.name || lastJobName;
+      if (data.job.running && data.job.name === "生成审核表") startReviewLongPoll();
       if (options.files) renderFiles(data);
       if (data.review) {
         if (options.review || reviewRows.length === 0) await loadReviewRows(Boolean(options.review));
@@ -883,9 +905,13 @@ INDEX_HTML = r"""<!doctype html>
       const wasRunning = lastJobRunning;
       const previousJobName = lastJobName;
       updateJobStatus(data);
+      latestEventId = Math.max(latestEventId, data.job.event_id || 0);
       lastJobRunning = data.job.running;
       lastJobName = data.job.name || lastJobName;
-      if (data.job.running) return;
+      if (data.job.running) {
+        if (data.job.name === "生成审核表") startReviewLongPoll();
+        return;
+      }
       if (!wasRunning) return;
       if (previousJobName === "生成审核表") {
         await refreshPageData({files: true, review: true});
@@ -943,6 +969,8 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       clearReviewRows();
+      reviewUpdateCursor = latestEventId;
+      startReviewLongPoll();
       postJson("/api/build-review", {files: Array.from(selectedInputs)});
     }
     async function startCut() {
@@ -985,18 +1013,41 @@ INDEX_HTML = r"""<!doctype html>
       }
       setTimeout(() => { copyStatusEl.textContent = ""; }, 1800);
     }
-    function connectEvents() {
-      if (!window.EventSource) return;
-      const source = new EventSource("/api/events");
-      source.addEventListener("review-updated", () => {
-        refreshReviewOnly();
-      });
-      source.addEventListener("job-finished", () => {
-        refreshPageData({files: true, review: false});
-      });
+    function stopReviewLongPoll() {
+      reviewLongPollActive = false;
+      if (reviewLongPollController) {
+        reviewLongPollController.abort();
+        reviewLongPollController = null;
+      }
+    }
+    async function startReviewLongPoll() {
+      if (reviewLongPollActive) return;
+      reviewLongPollActive = true;
+      while (reviewLongPollActive) {
+        reviewLongPollController = new AbortController();
+        try {
+          const response = await fetch(`/api/review-updates?since=${reviewUpdateCursor}`, {signal: reviewLongPollController.signal});
+          if (!response.ok) throw new Error(await response.text());
+          const data = await response.json();
+          reviewUpdateCursor = Math.max(reviewUpdateCursor, data.event_id || reviewUpdateCursor);
+          latestEventId = Math.max(latestEventId, data.event_id || latestEventId);
+          const events = data.events || [];
+          if (events.some(event => event.type === "review-updated")) await refreshReviewOnly();
+          const finished = events.find(event => event.type === "job-finished");
+          if (finished) {
+            await refreshPageData({files: true, review: false});
+            stopReviewLongPoll();
+          }
+        } catch (error) {
+          if (reviewLongPollActive) {
+            await new Promise(resolve => setTimeout(resolve, 1500));
+          }
+        } finally {
+          reviewLongPollController = null;
+        }
+      }
     }
     refreshPageData({files: true, review: true});
-    connectEvents();
     setInterval(pollJob, 2500);
   </script>
 </body>
@@ -1036,35 +1087,22 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
-        if parsed.path == "/api/events":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
+        if parsed.path == "/api/review-updates":
             try:
-                last_id = int(self.headers.get("Last-Event-ID", "0") or "0")
+                since = int(parse_qs(parsed.query).get("since", ["0"])[0] or "0")
             except ValueError:
-                last_id = 0
-            try:
-                while True:
-                    with EVENT_CONDITION:
-                        pending = [event for event in EVENTS if event["id"] > last_id]
-                        if not pending:
-                            EVENT_CONDITION.wait(timeout=15)
-                            pending = [event for event in EVENTS if event["id"] > last_id]
-                    if not pending:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-                        continue
-                    for event in pending:
-                        body = json.dumps(event["payload"], ensure_ascii=False)
-                        payload = f"id: {event['id']}\nevent: {event['type']}\ndata: {body}\n\n".encode("utf-8")
-                        self.wfile.write(payload)
-                        self.wfile.flush()
-                        last_id = int(event["id"])
-            except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                return
+                since = 0
+            event_id, events = wait_events(since)
+            self.send_json(
+                {
+                    "event_id": event_id,
+                    "events": [
+                        {"id": event["id"], "type": event["type"], "payload": event["payload"]}
+                        for event in events
+                    ],
+                }
+            )
+            return
         if parsed.path == "/api/status":
             self.send_json(snapshot())
             return
