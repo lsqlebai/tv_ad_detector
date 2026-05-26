@@ -26,6 +26,7 @@ OUTPUT_DIR = ROOT / "output"
 REVIEW_XLSX = OUTPUT_DIR / "ad_review.xlsx"
 CLEANED_DIR = OUTPUT_DIR / "cleaned"
 DETECT_DIR = OUTPUT_DIR / "detect"
+TEMPLATE_DIR = ROOT / "ad_templates"
 FRAME_FIELDS = ["start_before_frame", "start_frame", "middle_frame", "end_frame", "end_after_frame"]
 DURATION_CACHE: dict[str, tuple[float, int, float | None]] = {}
 
@@ -160,6 +161,14 @@ def safe_cleaned_file(value: str) -> Path | None:
     name = Path(value).name
     path = (CLEANED_DIR / name).resolve()
     if path.parent != CLEANED_DIR.resolve() or path.suffix.lower() != ".mp4":
+        return None
+    return path if path.exists() and path.is_file() else None
+
+
+def safe_input_file(value: str) -> Path | None:
+    name = Path(value).name
+    path = (INPUT_DIR / name).resolve()
+    if path.parent != INPUT_DIR.resolve() or path.suffix.lower() != ".mp4":
         return None
     return path if path.exists() and path.is_file() else None
 
@@ -616,6 +625,27 @@ INDEX_HTML = r"""<!doctype html>
     .pill.ok { color: var(--ok); border-color: #b8decf; background: #eefaf5; }
     .pill.warn { color: var(--warn); border-color: #f1d0a3; background: #fff7ed; }
     .pill.danger { color: var(--danger); border-color: #f0b8b8; background: #fff1f1; }
+    button.promote-template {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 54px;
+      height: 24px;
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-size: 12px;
+      background: #fff7ed;
+      color: var(--warn);
+      border-color: #f1d0a3;
+      white-space: nowrap;
+    }
+    button.promote-template::before { content: "需确认"; }
+    button.promote-template:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.promote-template:hover::before { content: "升模板"; }
     .table-wrap { overflow-x: auto; }
     th.frames-heading { text-align: center; }
     .review-actions {
@@ -960,7 +990,7 @@ INDEX_HTML = r"""<!doctype html>
             <td class="compact"><input class="time" value="${escapeHtml(row.end)}" oninput="updateReviewRow(${rowIndex}, 'end', this.value)"></td>
             <td class="compact">${escapeHtml(row.score || "")}</td>
             <td class="compact" title="${escapeHtml(row.kind || "")}">${escapeHtml(shortKind(row.kind))}</td>
-            <td class="compact">${row.review_required === "yes" ? '<span class="pill warn">需确认</span>' : '<span class="pill ok">可信</span>'}</td>
+            <td class="compact">${row.review_required === "yes" ? `<button type="button" class="promote-template" title="升级为模板" onclick="promoteTemplate(${rowIndex})"></button>` : '<span class="pill ok">可信</span>'}</td>
             <td class="frames-cell"><div class="frame-strip">${frames}</div></td>
           </tr>`);
         }
@@ -1105,6 +1135,30 @@ INDEX_HTML = r"""<!doctype html>
       }
       updateSelectionButtons();
       return true;
+    }
+    async function promoteTemplate(index) {
+      const row = reviewRows[index];
+      if (!row || reviewSaveInFlight) return;
+      if (reviewDirty) {
+        const saved = await saveReview(false);
+        if (!saved || reviewDirty) return;
+      }
+      reviewStatusEl.textContent = "正在生成模板...";
+      try {
+        const response = await fetch("/api/promote-template", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({file: row.file, start: row.start, end: row.end}),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || "生成模板失败");
+        reviewStatusEl.textContent = `已生成模板：${data.name}`;
+        setTimeout(() => {
+          if (reviewStatusEl.textContent.startsWith("已生成模板")) reviewStatusEl.textContent = "";
+        }, 2500);
+      } catch (error) {
+        reviewStatusEl.textContent = error.message || "生成模板失败";
+      }
     }
     function startBuild() {
       if (selectedInputs.size === 0) {
@@ -1314,6 +1368,46 @@ class Handler(BaseHTTPRequestHandler):
             ]
             ok, message = start_job("裁剪视频", command)
             self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            return
+        if parsed.path == "/api/promote-template":
+            with JOB_LOCK:
+                if JOB.running:
+                    self.send_json({"ok": False, "error": f"{JOB.name} is running"}, 409)
+                    return
+            video_path = safe_input_file(str(payload.get("file") or ""))
+            start_value = str(payload.get("start") or "").strip()
+            end_value = str(payload.get("end") or "").strip()
+            if video_path is None:
+                self.send_json({"ok": False, "error": "输入视频不存在"}, 400)
+                return
+            try:
+                start_seconds = parse_time_value(start_value)
+                end_seconds = parse_time_value(end_value)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+                return
+            if end_seconds <= start_seconds:
+                self.send_json({"ok": False, "error": "结束时间必须晚于开始时间"}, 400)
+                return
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "create_template.py"),
+                "--video",
+                str(video_path),
+                "--start",
+                start_value,
+                "--end",
+                end_value,
+                "--template-dir",
+                str(TEMPLATE_DIR),
+            ]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout or "生成模板失败").strip()
+                self.send_json({"ok": False, "error": message}, 500)
+                return
+            template_path = Path(result.stdout.strip().splitlines()[-1])
+            self.send_json({"ok": True, "path": rel(template_path), "name": template_path.name})
             return
         if parsed.path == "/api/delete-cleaned":
             deleted = []
