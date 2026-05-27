@@ -6,7 +6,12 @@ from typing import Optional
 from ..time_utils import parse_time
 from ..video_io import boundary_frames
 from .alignment import EdgeResolution, normalize_template_start_cut, resolve_ad_edge
-from .config import BOUNDARY_CONFIDENCE_THRESHOLD, BoundaryContext
+from .config import (
+    BOUNDARY_CONFIDENCE_THRESHOLD,
+    FAST_PATH_IMMEDIATE_VISUAL_THRESHOLD,
+    FAST_PATH_VISUAL_DELTA_THRESHOLD,
+    BoundaryContext,
+)
 from .cuts import boundary_has_cut, nearest_boundary_cut, nearest_cut_time
 
 
@@ -18,6 +23,7 @@ def find_boundary_repair_cut(
     duration: float,
     sample_rate: float,
     search_radius: float,
+    require_boundary_shift: bool = False,
 ) -> Optional[EdgeResolution]:
     lower = max(0.0, boundary_time - search_radius)
     upper = min(duration, boundary_time + search_radius)
@@ -28,6 +34,34 @@ def find_boundary_repair_cut(
     else:
         raise ValueError(f"Unknown boundary side: {side}")
     rows = boundary_frames(video_path, lower, upper, sample_rate, duration)
+    if require_boundary_shift:
+        candidates = [time_value for time_value, _, _, diff in rows if lower <= time_value <= upper and diff >= 0.14]
+        if side == "start":
+            after_candidates = sorted(
+                [cut_time for cut_time in candidates if cut_time >= boundary_time],
+                key=lambda cut_time: abs(cut_time - boundary_time),
+            )
+            before_candidates = sorted(
+                [cut_time for cut_time in candidates if cut_time < boundary_time],
+                key=lambda cut_time: abs(cut_time - boundary_time),
+            )
+            candidates = after_candidates + before_candidates
+        else:
+            candidates.sort(key=lambda cut_time: abs(cut_time - boundary_time))
+        seen: set[float] = set()
+        for cut_time in candidates:
+            key = round(cut_time, 3)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolution = resolve_ad_edge(video_path, cut_time, sample_rate, side)
+            if resolution is None:
+                continue
+            if abs(resolution.ad_frame - boundary_time) <= 0.5 / sample_rate:
+                continue
+            return resolution
+        return None
+
     cut_time = nearest_boundary_cut(rows, boundary_time, lower, upper)
     if cut_time is not None and abs(cut_time - boundary_time) <= 1.5 / sample_rate:
         return resolve_ad_edge(video_path, cut_time, sample_rate, side)
@@ -64,6 +98,18 @@ def mark_repair_skip(result: dict, side: str) -> None:
     result["boundary_debug"] = debug
 
 
+def edge_semantics_support_fast_path(debug: dict, side: str) -> bool:
+    try:
+        ad_immediate_visual = float(debug.get(f"{side}_ad_immediate_visual_score"))
+        visual_delta = float(debug.get(f"{side}_visual_delta"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        ad_immediate_visual >= FAST_PATH_IMMEDIATE_VISUAL_THRESHOLD
+        and visual_delta >= FAST_PATH_VISUAL_DELTA_THRESHOLD
+    )
+
+
 def high_confidence_template_fast_path(item: dict) -> bool:
     if item.get("kind") != "template_library":
         return False
@@ -84,6 +130,8 @@ def high_confidence_template_fast_path(item: dict) -> bool:
         and end_visual >= 0.65
         and not debug.get("start_expanded_used")
         and not debug.get("end_expanded_used")
+        and edge_semantics_support_fast_path(debug, "start")
+        and edge_semantics_support_fast_path(debug, "end")
     )
 
 
@@ -228,6 +276,7 @@ def repair_snapshot_similar_boundaries(
                     duration,
                     sample_rate,
                     search_radius,
+                    require_boundary_shift=start_has_boundary_error,
                 )
                 repaired_start = repaired_start_edge.ad_frame if repaired_start_edge is not None else None
                 if repaired_start is not None and repaired_start < end and abs(repaired_start - start) > 0.5 / sample_rate:
@@ -247,6 +296,7 @@ def repair_snapshot_similar_boundaries(
                     duration,
                     sample_rate,
                     search_radius,
+                    require_boundary_shift=True,
                 )
                 repaired_end = repaired_end_edge.ad_frame if repaired_end_edge is not None else None
                 repaired_end_after = repaired_end_edge.content_frame if repaired_end_edge is not None else None

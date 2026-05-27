@@ -9,7 +9,14 @@ import numpy as np
 from ..features import frame_diff_score, robust_norm
 from ..models import METRIC_COLUMNS
 from ..video_io import boundary_frames, read_scaled_frame
-from .config import BOUNDARY_CONFIDENCE_THRESHOLD, BoundaryContext, BoundaryRefineSettings, boundary_refine_settings, expanded_boundary_refine_settings
+from .config import (
+    BOUNDARY_CONFIDENCE_THRESHOLD,
+    FAST_PATH_IMMEDIATE_WINDOW_SECONDS,
+    BoundaryContext,
+    BoundaryRefineSettings,
+    boundary_refine_settings,
+    expanded_boundary_refine_settings,
+)
 from .cuts import any_dark_transition_end, dark_transition_end, leading_cut_time, strong_cut_candidates, strongest_cut_time, strongest_cut_time_between, trailing_cut_time
 from .scoring import cut_confidence
 
@@ -21,6 +28,13 @@ class EdgeResolution:
 
 
 @dataclass(frozen=True)
+class EdgeSemanticScores:
+    ad_immediate_visual_score: Optional[float] = None
+    content_immediate_visual_score: Optional[float] = None
+    visual_delta: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class ScoredEdge:
     resolution: EdgeResolution
     score: float
@@ -28,6 +42,7 @@ class ScoredEdge:
     visual_score: Optional[float] = None
     ad_visual_score: Optional[float] = None
     content_visual_score: Optional[float] = None
+    semantic_scores: Optional[EdgeSemanticScores] = None
 
 
 def normalize_template_start_cut(video_path: Path, cut_time: Optional[float], sample_rate: float) -> Optional[float]:
@@ -186,6 +201,39 @@ def edge_ad_visual_score(
     raise ValueError(f"Unknown boundary side: {side}")
 
 
+def edge_semantic_scores(
+    side: str,
+    resolution: EdgeResolution,
+    sample_times: Optional[np.ndarray],
+    visual_scores: Optional[np.ndarray],
+    duration: float,
+    window: float = FAST_PATH_IMMEDIATE_WINDOW_SECONDS,
+) -> EdgeSemanticScores:
+    if side == "start":
+        content_end = resolution.ad_frame
+        content_start = max(0.0, content_end - window)
+        ad_start = resolution.ad_frame
+        ad_end = min(duration, ad_start + window)
+    elif side == "end":
+        ad_end = resolution.ad_frame
+        ad_start = max(0.0, ad_end - window)
+        content_start = resolution.content_frame if resolution.content_frame is not None else resolution.ad_frame
+        content_end = min(duration, content_start + window)
+    else:
+        raise ValueError(f"Unknown boundary side: {side}")
+
+    ad_visual = window_visual_score(sample_times, visual_scores, ad_start, ad_end)
+    content_visual = window_visual_score(sample_times, visual_scores, content_start, content_end)
+    visual_delta = None
+    if ad_visual is not None and content_visual is not None:
+        visual_delta = ad_visual - content_visual
+    return EdgeSemanticScores(
+        ad_immediate_visual_score=ad_visual,
+        content_immediate_visual_score=content_visual,
+        visual_delta=visual_delta,
+    )
+
+
 def candidate_cut_times(
     side: str,
     rows: list[tuple[float, float, float, float]],
@@ -254,6 +302,21 @@ def refined_time_from_ad_frame(side: str, ad_frame_time: float, sample_rate: flo
     raise ValueError(f"Unknown boundary side: {side}")
 
 
+def rounded_optional(value: Optional[float], digits: int = 3) -> Optional[float]:
+    return round(value, digits) if value is not None else None
+
+
+def add_edge_semantic_debug(debug: dict, prefix: str, scores: Optional[EdgeSemanticScores]) -> None:
+    if scores is None:
+        debug[f"{prefix}_ad_immediate_visual_score"] = None
+        debug[f"{prefix}_content_immediate_visual_score"] = None
+        debug[f"{prefix}_visual_delta"] = None
+        return
+    debug[f"{prefix}_ad_immediate_visual_score"] = rounded_optional(scores.ad_immediate_visual_score)
+    debug[f"{prefix}_content_immediate_visual_score"] = rounded_optional(scores.content_immediate_visual_score)
+    debug[f"{prefix}_visual_delta"] = rounded_optional(scores.visual_delta)
+
+
 def refine_cut(
     side: str,
     video_path: Path,
@@ -282,7 +345,15 @@ def refine_edge_candidate(
 ) -> Optional[ScoredEdge]:
     if side == "start" and center <= 1.0:
         resolution = EdgeResolution(ad_frame=center)
-        return ScoredEdge(resolution=resolution, score=1.0, cut_score=1.0, visual_score=1.0, ad_visual_score=1.0)
+        semantic_scores = edge_semantic_scores(side, resolution, sample_times, visual_scores, duration)
+        return ScoredEdge(
+            resolution=resolution,
+            score=1.0,
+            cut_score=1.0,
+            visual_score=1.0,
+            ad_visual_score=1.0,
+            semantic_scores=semantic_scores,
+        )
 
     candidates = candidate_cut_times(side, rows, center, sample_rate, duration, settings)
     fallback_cut_time = boundary_candidate_time(side, rows, center, sample_rate, duration, settings)
@@ -328,6 +399,7 @@ def refine_edge_candidate(
         sample_rate,
     )
     visual_score, ad_visual, content_visual = edge_ad_visual_score(side, resolution, sample_times, visual_scores, duration)
+    semantic_scores = edge_semantic_scores(side, resolution, sample_times, visual_scores, duration)
     score = cut_score if visual_score is None else 0.45 * cut_score + 0.55 * visual_score
     return ScoredEdge(
         resolution=resolution,
@@ -336,6 +408,7 @@ def refine_edge_candidate(
         visual_score=visual_score,
         ad_visual_score=ad_visual,
         content_visual_score=content_visual,
+        semantic_scores=semantic_scores,
     )
 
 
@@ -391,11 +464,13 @@ def refine_detection_boundaries(
         refined_start = refined_start_candidate.resolution.ad_frame if refined_start_candidate is not None else None
         start_score = refined_start_candidate.score if refined_start_candidate is not None else 0.0
         start_visual_score = refined_start_candidate.visual_score if refined_start_candidate is not None else None
+        start_semantic_scores = refined_start_candidate.semantic_scores if refined_start_candidate is not None else None
         refined_end_candidate = refine_edge_candidate("end", video_path, end_rows, end, sample_rate, duration, settings, sample_times, visual_scores)
         refined_end = refined_end_candidate.resolution.ad_frame if refined_end_candidate is not None else None
         refined_end_after = refined_end_candidate.resolution.content_frame if refined_end_candidate is not None else None
         end_score = refined_end_candidate.score if refined_end_candidate is not None else 0.0
         end_visual_score = refined_end_candidate.visual_score if refined_end_candidate is not None else None
+        end_semantic_scores = refined_end_candidate.semantic_scores if refined_end_candidate is not None else None
 
         expanded_settings = expanded_boundary_refine_settings()
         start_expanded_attempt = start_score < BOUNDARY_CONFIDENCE_THRESHOLD
@@ -427,6 +502,7 @@ def refine_detection_boundaries(
                 refined_start = expanded_start
                 start_score = expanded_start_score
                 start_visual_score = expanded_start_candidate.visual_score if expanded_start_candidate is not None else None
+                start_semantic_scores = expanded_start_candidate.semantic_scores if expanded_start_candidate is not None else None
                 start_expanded_used = True
 
         if end_expanded_attempt:
@@ -456,6 +532,7 @@ def refine_detection_boundaries(
                 refined_end_after = expanded_end_after
                 end_score = expanded_end_score
                 end_visual_score = expanded_end_candidate.visual_score if expanded_end_candidate is not None else None
+                end_semantic_scores = expanded_end_candidate.semantic_scores if expanded_end_candidate is not None else None
                 end_expanded_used = True
 
         notes = []
@@ -479,8 +556,8 @@ def refine_detection_boundaries(
             {
                 "start_score": round(start_score, 3),
                 "end_score": round(end_score, 3),
-                "start_visual_score": round(start_visual_score, 3) if start_visual_score is not None else None,
-                "end_visual_score": round(end_visual_score, 3) if end_visual_score is not None else None,
+                "start_visual_score": rounded_optional(start_visual_score),
+                "end_visual_score": rounded_optional(end_visual_score),
                 "start_expanded_attempt": start_expanded_attempt,
                 "start_expanded_used": start_expanded_used,
                 "end_expanded_attempt": end_expanded_attempt,
@@ -489,6 +566,8 @@ def refine_detection_boundaries(
                 "end_seconds_before": round(end, 3),
             }
         )
+        add_edge_semantic_debug(debug, "start", start_semantic_scores)
+        add_edge_semantic_debug(debug, "end", end_semantic_scores)
         result["boundary_debug"] = debug
         refined.append(result)
     return refined

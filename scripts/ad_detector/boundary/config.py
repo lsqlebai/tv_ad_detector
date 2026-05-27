@@ -27,6 +27,9 @@ class BoundaryContext:
 
 
 BOUNDARY_CONFIDENCE_THRESHOLD = 0.70
+FAST_PATH_IMMEDIATE_VISUAL_THRESHOLD = 0.65
+FAST_PATH_VISUAL_DELTA_THRESHOLD = 0.12
+FAST_PATH_IMMEDIATE_WINDOW_SECONDS = 0.5
 
 
 def boundary_refine_settings(kind: str, default_radius: float) -> BoundaryRefineSettings:
