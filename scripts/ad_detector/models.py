@@ -20,6 +20,7 @@ class Detection:
     end: float
     score: float
     kind: str
+    end_after: Optional[float] = None
     sources: list[str] = field(default_factory=list)
     snapshots: dict[str, str] = field(default_factory=dict)
 
@@ -30,6 +31,7 @@ class Detection:
             end=float(item["end"]),
             score=float(item["score"]),
             kind=str(item["kind"]),
+            end_after=float(item["end_after"]) if item.get("end_after") not in (None, "") else None,
             sources=[str(source) for source in item.get("sources", [])],
             snapshots={str(key): str(value) for key, value in item.get("snapshots", {}).items()},
         )
@@ -42,6 +44,8 @@ class Detection:
             "kind": self.kind,
             "sources": list(self.sources),
         }
+        if self.end_after is not None:
+            payload["end_after"] = self.end_after
         if self.snapshots:
             payload["snapshots"] = dict(self.snapshots)
         return payload

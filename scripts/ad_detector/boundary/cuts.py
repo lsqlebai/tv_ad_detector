@@ -54,7 +54,7 @@ def dark_transition_end(rows: list[tuple[float, float, float, float]], center: f
     dark_times = [time_value for time_value, brightness, dark_ratio, _ in rows if time_value >= center - 1.0 and brightness < 0.16 and dark_ratio > 0.65]
     if not dark_times:
         return None
-    return max(dark_times) + 1.0 / sample_rate
+    return max(dark_times)
 
 
 def any_dark_transition_end(
@@ -66,7 +66,7 @@ def any_dark_transition_end(
     dark_times = [time_value for time_value, brightness, dark_ratio, _ in rows if lower <= time_value <= upper and brightness < 0.08 and dark_ratio > 0.9]
     if not dark_times:
         return None
-    return max(dark_times) + 1.0 / sample_rate
+    return max(dark_times)
 
 
 def trailing_cut_time(
@@ -80,7 +80,7 @@ def trailing_cut_time(
         return None
     max_diff = max(row[3] for row in candidates)
     strong = [row for row in candidates if row[3] >= max(0.14, max_diff * 0.72)]
-    return min(row[0] for row in strong) + 1.0 / sample_rate
+    return min(row[0] for row in strong)
 
 
 def boundary_has_cut(rows: list[tuple[float, float, float, float]], center: float, radius: float = 0.2) -> bool:

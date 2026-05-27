@@ -11,7 +11,6 @@ from typing import Optional
 import imageio_ffmpeg
 from openpyxl import load_workbook
 
-
 def parse_time(value: str) -> float:
     parts = [float(part) for part in value.strip().split(":")]
     if len(parts) == 1:
@@ -128,6 +127,7 @@ def read_review_ranges(path: Path) -> dict[str, list[tuple[float, float]]]:
         file_name = str(ws.cell(row=row_index, column=headers["file"]).value or "").strip()
         start_value = ws.cell(row=row_index, column=headers["start"]).value
         end_value = ws.cell(row=row_index, column=headers["end"]).value
+        end_after_value = ws.cell(row=row_index, column=headers["end_after_seconds"]).value if "end_after_seconds" in headers else None
         if start_value in (None, "") and "start_seconds" in headers:
             start_value = ws.cell(row=row_index, column=headers["start_seconds"]).value
         if end_value in (None, "") and "end_seconds" in headers:
@@ -135,7 +135,7 @@ def read_review_ranges(path: Path) -> dict[str, list[tuple[float, float]]]:
         if not file_name or start_value in (None, "") or end_value in (None, ""):
             continue
         start = parse_time(str(start_value))
-        end = parse_time(str(end_value))
+        end = parse_time(str(end_after_value)) if end_after_value not in (None, "") else parse_time(str(end_value))
         ranges_by_file.setdefault(file_name, []).append((start, end))
 
     return {file_name: merge_ranges(ranges) for file_name, ranges in ranges_by_file.items()}

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from .alignment import align_detection_boundaries
 from .config import BoundaryContext
 from .validation import validate_detection_boundaries
@@ -13,11 +15,20 @@ class BoundaryRefiner:
         self.write_debug_files = write_debug_files
         self.sample_rate = sample_rate
 
-    def refine(self, video_path: Path, detections: list[dict], duration: float) -> list[dict]:
+    def refine(
+        self,
+        video_path: Path,
+        detections: list[dict],
+        duration: float,
+        sample_times: np.ndarray | None = None,
+        sample_metrics: np.ndarray | None = None,
+    ) -> list[dict]:
         context = BoundaryContext(
             video_path,
             duration,
             self.sample_rate,
+            sample_times=sample_times,
+            sample_metrics=sample_metrics,
             output_dir=self.output_dir,
             write_debug_files=self.write_debug_files,
         )

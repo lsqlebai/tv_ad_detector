@@ -19,6 +19,9 @@ BOUNDARY_ERROR_PAIRS = [
     ("start", "start", "end_after"),
     ("end", "start_before", "end"),
 ]
+ADJACENT_FRAME_STEP = 1.0 / 24.0
+
+
 def boundary_debug_json(item: dict, boundary_review_notes: list[str]) -> str:
     debug = dict(item.get("boundary_debug", {}))
     if boundary_review_notes:
@@ -31,11 +34,11 @@ def boundary_debug_json(item: dict, boundary_review_notes: list[str]) -> str:
 
 def snapshot_targets(detections: list[dict], duration: float) -> list[dict]:
     targets: list[dict] = []
-    adjacent_frame_step = 1.0 / 24.0
     max_snapshot_time = max(0.0, duration - 0.5)
     for index, item in enumerate(detections, start=1):
         start = float(item["start"])
         end = float(item["end"])
+        end_after = float(item.get("end_after") or end)
         if end <= start:
             targets.append({"detection": index, "label": "start", "time": start})
             continue
@@ -43,11 +46,11 @@ def snapshot_targets(detections: list[dict], duration: float) -> list[dict]:
         span = end - start
         mid = start + span / 2
         points = [
-            ("start_before", max(0.0, start - adjacent_frame_step), False),
+            ("start_before", max(0.0, start - ADJACENT_FRAME_STEP), False),
             ("start", min(max_snapshot_time, start), False),
             ("middle", min(max_snapshot_time, mid), False),
-            ("end", min(max_snapshot_time, max(start, end - adjacent_frame_step)), False),
-            ("end_after", min(max_snapshot_time, end + adjacent_frame_step), end >= duration - 0.5),
+            ("end", min(max_snapshot_time, max(start, end)), False),
+            ("end_after", min(max_snapshot_time, end_after), end_after >= duration - 0.5),
         ]
         for label, point_time, is_placeholder in points:
             targets.append({"detection": index, "label": label, "time": point_time, "placeholder": is_placeholder})
@@ -162,6 +165,7 @@ def write_outputs(
                 "end",
                 "start_seconds",
                 "end_seconds",
+                "end_after_seconds",
                 "score",
                 "kind",
                 "sources",
@@ -180,12 +184,14 @@ def write_outputs(
             boundary_review_notes = boundary_notes.get(index, [])
             review_required = (item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD) or bool(boundary_review_notes)
             sources = sorted(set(item["sources"]) | set(boundary_review_notes))
+            end_after = float(item.get("end_after") or item["end"])
             writer.writerow(
                 {
                     "start": format_time(item["start"]),
                     "end": format_time(item["end"]) if item["end"] > item["start"] else "",
                     "start_seconds": round(item["start"], 3),
                     "end_seconds": round(item["end"], 3) if item["end"] > item["start"] else "",
+                    "end_after_seconds": round(end_after, 3) if item["end"] > item["start"] else "",
                     "score": round(item["score"], 4),
                     "kind": item["kind"],
                     "sources": ";".join(sources),
@@ -206,10 +212,11 @@ def write_outputs(
         trusted_lines = []
         candidate_lines = []
         for item in detections:
+            line_end = float(item.get("end_after") or item["end"])
             if item["end"] <= item["start"]:
                 line = f"{format_time(item['start'])}-"
             else:
-                line = f"{format_time(item['start'])}-{format_time(item['end'])}"
+                line = f"{format_time(item['start'])}-{format_time(line_end)}"
             candidate_lines.append(line)
             if item["kind"] != "auto_discovery":
                 trusted_lines.append(line)

@@ -10,7 +10,6 @@ from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl import load_workbook
 
-
 HEADERS = [
     "candidate_id",
     "delete",
@@ -19,6 +18,7 @@ HEADERS = [
     "end",
     "start_seconds",
     "end_seconds",
+    "end_after_seconds",
     "score",
     "kind",
     "review_required",
@@ -32,11 +32,11 @@ HEADERS = [
 ]
 
 FRAME_COLUMNS = [
-    ("start_before_frame", "M"),
-    ("start_frame", "N"),
-    ("middle_frame", "O"),
-    ("end_frame", "P"),
-    ("end_after_frame", "Q"),
+    ("start_before_frame", "N"),
+    ("start_frame", "O"),
+    ("middle_frame", "P"),
+    ("end_frame", "Q"),
+    ("end_after_frame", "R"),
 ]
 
 
@@ -116,6 +116,10 @@ def read_existing_reviews(xlsx_path: Path) -> tuple[dict[str, dict], dict[tuple[
         start_value = str(ws.cell(row=row_index, column=headers["start"]).value or "").strip()
         end_value = str(ws.cell(row=row_index, column=headers["end"]).value or "").strip()
         existing = {"delete": delete_value, "start": start_value, "end": end_value}
+        if "end_after_seconds" in headers:
+            end_after_value = ws.cell(row=row_index, column=headers["end_after_seconds"]).value
+            if end_after_value not in (None, ""):
+                existing["end_after_seconds"] = end_after_value
         candidate_id = str(ws.cell(row=row_index, column=headers["candidate_id"]).value or "").strip() if "candidate_id" in headers else ""
         if candidate_id:
             by_id[candidate_id] = existing
@@ -150,6 +154,8 @@ def apply_existing_reviews(rows: list[dict], xlsx_path: Path) -> None:
         if existing.get("end"):
             row["end"] = existing["end"]
             row["end_seconds"] = parse_time(existing["end"])
+        if existing.get("end_after_seconds") not in (None, ""):
+            row["end_after_seconds"] = existing["end_after_seconds"]
 
 
 def resolve_image_path(workbook_dir: Path, value: str) -> Path:
@@ -184,6 +190,7 @@ def row_values(row: dict) -> list:
         display_time(row, "end"),
         float(row["start_seconds"]) if row.get("start_seconds") else None,
         float(row["end_seconds"]) if row.get("end_seconds") else None,
+        float(row["end_after_seconds"]) if row.get("end_after_seconds") else None,
         float(row["score"]) if row.get("score") else None,
         row.get("kind", ""),
         row.get("review_required", ""),
@@ -231,7 +238,7 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
         dv.add(ws.cell(row=row_index, column=2))
 
     last_row = max(5, len(rows) + 4)
-    ws.auto_filter.ref = f"A4:Q{last_row}"
+    ws.auto_filter.ref = f"A4:R{last_row}"
     ws.freeze_panes = "A5"
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 10
@@ -241,26 +248,28 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
     ws.column_dimensions["F"].width = 10
     ws.column_dimensions["G"].width = 10
     ws.column_dimensions["H"].width = 10
-    ws.column_dimensions["I"].width = 20
-    ws.column_dimensions["J"].width = 16
-    ws.column_dimensions["K"].width = 42
-    ws.column_dimensions["L"].width = 48
+    ws.column_dimensions["I"].width = 10
+    ws.column_dimensions["J"].width = 20
+    ws.column_dimensions["K"].width = 16
+    ws.column_dimensions["L"].width = 42
     ws.column_dimensions["M"].width = 26
     ws.column_dimensions["N"].width = 26
     ws.column_dimensions["O"].width = 26
     ws.column_dimensions["P"].width = 26
     ws.column_dimensions["Q"].width = 26
+    ws.column_dimensions["R"].width = 26
     ws.column_dimensions["A"].hidden = True
     ws.column_dimensions["F"].hidden = True
     ws.column_dimensions["G"].hidden = True
+    ws.column_dimensions["H"].hidden = True
 
     ws.conditional_formatting.add(
-        f"A5:Q{last_row}",
+        f"A5:R{last_row}",
         FormulaRule(formula=["$B5=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A5:Q{last_row}",
-        FormulaRule(formula=["$J5=\"yes\""], fill=review_fill),
+        f"A5:R{last_row}",
+        FormulaRule(formula=["$K5=\"yes\""], fill=review_fill),
     )
 
     summary = wb.create_sheet("Summary")
@@ -337,14 +346,14 @@ def append_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> int:
         dv.add(ws.cell(row=row_index, column=2))
 
     last_row = ws.max_row
-    ws.auto_filter.ref = f"A4:Q{last_row}"
+    ws.auto_filter.ref = f"A4:R{last_row}"
     ws.conditional_formatting.add(
-        f"A{start_row}:Q{last_row}",
+        f"A{start_row}:R{last_row}",
         FormulaRule(formula=[f"$B{start_row}=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A{start_row}:Q{last_row}",
-        FormulaRule(formula=[f"$J{start_row}=\"yes\""], fill=review_fill),
+        f"A{start_row}:R{last_row}",
+        FormulaRule(formula=[f"$K{start_row}=\"yes\""], fill=review_fill),
     )
     if "Summary" in wb.sheetnames:
         summary = wb["Summary"]
