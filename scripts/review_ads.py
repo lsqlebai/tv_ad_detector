@@ -23,6 +23,7 @@ HEADERS = [
     "kind",
     "review_required",
     "sources",
+    "boundary_debug",
     "start_before_frame",
     "start_frame",
     "middle_frame",
@@ -31,11 +32,11 @@ HEADERS = [
 ]
 
 FRAME_COLUMNS = [
-    ("start_before_frame", "L"),
-    ("start_frame", "M"),
-    ("middle_frame", "N"),
-    ("end_frame", "O"),
-    ("end_after_frame", "P"),
+    ("start_before_frame", "M"),
+    ("start_frame", "N"),
+    ("middle_frame", "O"),
+    ("end_frame", "P"),
+    ("end_after_frame", "Q"),
 ]
 
 
@@ -187,6 +188,7 @@ def row_values(row: dict) -> list:
         row.get("kind", ""),
         row.get("review_required", ""),
         row.get("sources", ""),
+        row.get("boundary_debug", ""),
         "",
         "",
         "",
@@ -229,7 +231,7 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
         dv.add(ws.cell(row=row_index, column=2))
 
     last_row = max(5, len(rows) + 4)
-    ws.auto_filter.ref = f"A4:P{last_row}"
+    ws.auto_filter.ref = f"A4:Q{last_row}"
     ws.freeze_panes = "A5"
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 10
@@ -242,21 +244,22 @@ def build_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> None:
     ws.column_dimensions["I"].width = 20
     ws.column_dimensions["J"].width = 16
     ws.column_dimensions["K"].width = 42
-    ws.column_dimensions["L"].width = 26
+    ws.column_dimensions["L"].width = 48
     ws.column_dimensions["M"].width = 26
     ws.column_dimensions["N"].width = 26
     ws.column_dimensions["O"].width = 26
     ws.column_dimensions["P"].width = 26
+    ws.column_dimensions["Q"].width = 26
     ws.column_dimensions["A"].hidden = True
     ws.column_dimensions["F"].hidden = True
     ws.column_dimensions["G"].hidden = True
 
     ws.conditional_formatting.add(
-        f"A5:P{last_row}",
+        f"A5:Q{last_row}",
         FormulaRule(formula=["$B5=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A5:P{last_row}",
+        f"A5:Q{last_row}",
         FormulaRule(formula=["$J5=\"yes\""], fill=review_fill),
     )
 
@@ -334,13 +337,13 @@ def append_workbook(rows: list[dict], output_dir: Path, xlsx_path: Path) -> int:
         dv.add(ws.cell(row=row_index, column=2))
 
     last_row = ws.max_row
-    ws.auto_filter.ref = f"A4:P{last_row}"
+    ws.auto_filter.ref = f"A4:Q{last_row}"
     ws.conditional_formatting.add(
-        f"A{start_row}:P{last_row}",
+        f"A{start_row}:Q{last_row}",
         FormulaRule(formula=[f"$B{start_row}=\"YES\""], fill=trusted_fill),
     )
     ws.conditional_formatting.add(
-        f"A{start_row}:P{last_row}",
+        f"A{start_row}:Q{last_row}",
         FormulaRule(formula=[f"$J{start_row}=\"yes\""], fill=review_fill),
     )
     if "Summary" in wb.sheetnames:

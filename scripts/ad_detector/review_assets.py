@@ -19,6 +19,14 @@ BOUNDARY_ERROR_PAIRS = [
     ("start", "start", "end_after"),
     ("end", "start_before", "end"),
 ]
+def boundary_debug_json(item: dict, boundary_review_notes: list[str]) -> str:
+    debug = dict(item.get("boundary_debug", {}))
+    if boundary_review_notes:
+        debug["review_notes"] = boundary_review_notes
+        debug["review_note_count"] = len(boundary_review_notes)
+    if not debug:
+        return ""
+    return json.dumps(debug, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def snapshot_targets(detections: list[dict], duration: float) -> list[dict]:
@@ -158,6 +166,7 @@ def write_outputs(
                 "kind",
                 "sources",
                 "review_required",
+                "boundary_debug",
                 "start_before_frame",
                 "start_frame",
                 "middle_frame",
@@ -181,6 +190,7 @@ def write_outputs(
                     "kind": item["kind"],
                     "sources": ";".join(sources),
                     "review_required": "yes" if review_required else "no",
+                    "boundary_debug": boundary_debug_json(item, boundary_review_notes),
                     "start_before_frame": item_snapshots.get("start_before", ""),
                     "start_frame": item_snapshots.get("start", ""),
                     "middle_frame": item_snapshots.get("middle", ""),
