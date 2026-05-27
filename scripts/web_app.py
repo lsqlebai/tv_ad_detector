@@ -5,6 +5,8 @@ import argparse
 import csv
 import json
 import mimetypes
+import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,8 @@ class JobState:
     finished_at: float = 0.0
     returncode: int | None = None
     log: list[str] = field(default_factory=list)
+    process: subprocess.Popen | None = None
+    stop_requested: bool = False
 
 
 JOB = JobState()
@@ -191,6 +195,7 @@ def job_snapshot() -> dict:
             "finished_at": JOB.finished_at,
             "returncode": JOB.returncode,
             "log": JOB.log[-300:],
+            "stop_requested": JOB.stop_requested,
         }
     with EVENT_CONDITION:
         payload["event_id"] = EVENT_ID
@@ -242,6 +247,8 @@ def run_job(name: str, command: list[str]) -> None:
         JOB.finished_at = 0.0
         JOB.returncode = None
         JOB.log = [f"$ {' '.join(command)}"]
+        JOB.process = None
+        JOB.stop_requested = False
 
     try:
         process = subprocess.Popen(
@@ -251,7 +258,10 @@ def run_job(name: str, command: list[str]) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
+        with JOB_LOCK:
+            JOB.process = process
         assert process.stdout is not None
         for line in process.stdout:
             append_log(line)
@@ -266,6 +276,7 @@ def run_job(name: str, command: list[str]) -> None:
         JOB.running = False
         JOB.finished_at = time.time()
         JOB.returncode = returncode
+        JOB.process = None
         JOB.log.append(f"Finished with exit code {returncode}")
     publish_event("job-finished", {"name": name, "returncode": returncode})
 
@@ -277,6 +288,44 @@ def start_job(name: str, command: list[str]) -> tuple[bool, str]:
     thread = threading.Thread(target=run_job, args=(name, command), daemon=True)
     thread.start()
     return True, "started"
+
+
+def stop_job() -> tuple[bool, str]:
+    with JOB_LOCK:
+        if not JOB.running or JOB.process is None:
+            return False, "没有正在运行的任务"
+        process = JOB.process
+        JOB.stop_requested = True
+        JOB.log.append("Stop requested; terminating job...")
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.terminate()
+        except Exception as exc:
+            append_log(f"ERROR: failed to stop job: {exc}")
+            return False, str(exc)
+
+    def force_kill_later(target: subprocess.Popen) -> None:
+        time.sleep(5)
+        if target.poll() is not None:
+            return
+        append_log("Job did not stop after SIGTERM; killing process group...")
+        try:
+            os.killpg(target.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                target.kill()
+            except Exception as exc:
+                append_log(f"ERROR: failed to kill job: {exc}")
+
+    threading.Thread(target=force_kill_later, args=(process,), daemon=True).start()
+    return True, "stopping"
 
 
 def safe_output_path(value: str) -> Path | None:
@@ -292,8 +341,7 @@ def safe_output_path(value: str) -> Path | None:
 
 
 def file_url(path: str, inline: bool = False) -> str:
-    suffix = "?inline=1" if inline else ""
-    return f"/files/{quote(path)}{suffix}"
+    return f"/files/{quote(path)}"
 
 
 def parse_time_value(value: str) -> float:
@@ -358,7 +406,7 @@ def read_review_rows() -> list[dict]:
     frames_by_key, frames_by_file = detect_frame_indexes()
     file_offsets: dict[str, int] = {}
     rows: list[dict] = []
-    optional = ["score", "kind", "review_required", "sources", *FRAME_FIELDS]
+    optional = ["end_after_seconds", "score", "kind", "review_required", "sources", *FRAME_FIELDS]
     for row_index in range(header_row + 1, ws.max_row + 1):
         file_name = str(ws.cell(row=row_index, column=headers["file"]).value or "").strip()
         if not file_name:
@@ -392,7 +440,7 @@ def read_review_rows() -> list[dict]:
             if frame_path in {"__VIDEO_END__", "视频结束"}:
                 row[f"{name}_label"] = "视频结束"
             elif frame_path:
-                row[f"{name}_url"] = file_url(frame_path, inline=True)
+                row[f"{name}_url"] = file_url(frame_path, inline=False)
                 row[f"{name}_download_url"] = file_url(frame_path, inline=False)
         rows.append(row)
     return rows
@@ -433,6 +481,10 @@ def save_review_rows(rows: list[dict]) -> int:
             ws.cell(row=row_index, column=headers["start_seconds"], value=start_seconds)
         if "end_seconds" in headers:
             ws.cell(row=row_index, column=headers["end_seconds"], value=end_seconds)
+        if "end_after_seconds" in headers:
+            end_after_value = str(item.get("end_after_seconds") or "").strip()
+            if end_after_value:
+                ws.cell(row=row_index, column=headers["end_after_seconds"], value=parse_time_value(end_after_value))
         changed += 1
     tmp_path = REVIEW_XLSX.with_suffix(".tmp.xlsx")
     wb.save(tmp_path)
@@ -510,6 +562,7 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 600;
     }
     button.secondary { background: #fff; color: var(--text); border-color: var(--line); }
+    button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     label { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
     input[type="number"] { width: 88px; }
@@ -736,6 +789,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="module-head">
         <h2>日志</h2>
         <div class="actions">
+          <button id="stopJobBtn" class="danger" onclick="stopJob()">停止任务</button>
           <button class="secondary" onclick="copyLog()">复制日志</button>
           <span id="copyStatus" class="muted"></span>
         </div>
@@ -749,6 +803,7 @@ INDEX_HTML = r"""<!doctype html>
     const buildBtn = document.getElementById("buildBtn");
     const cutBtn = document.getElementById("cutBtn");
     const deleteCleanedBtn = document.getElementById("deleteCleanedBtn");
+    const stopJobBtn = document.getElementById("stopJobBtn");
     const reviewRowsEl = document.getElementById("reviewRows");
     const reviewStatusEl = document.getElementById("reviewStatus");
     const copyStatusEl = document.getElementById("copyStatus");
@@ -839,6 +894,7 @@ INDEX_HTML = r"""<!doctype html>
       buildBtn.disabled = currentRunning || selectedInputs.size === 0;
       cutBtn.disabled = currentRunning || !currentHasReview || reviewSaveInFlight;
       deleteCleanedBtn.disabled = currentRunning || selectedCleaned.size === 0;
+      stopJobBtn.disabled = !currentRunning;
     }
     let latestInputs = [];
     let latestCleaned = [];
@@ -1040,7 +1096,7 @@ INDEX_HTML = r"""<!doctype html>
       const running = data.job.running;
       currentRunning = running;
       stateEl.className = "pill " + (running ? "warn" : data.job.returncode === 0 ? "ok" : data.job.returncode ? "danger" : "");
-      stateEl.textContent = running ? `${data.job.name} 运行中` : data.job.returncode === 0 ? "空闲，上次成功" : data.job.returncode ? "空闲，上次失败" : "空闲";
+      stateEl.textContent = running ? `${data.job.name} ${data.job.stop_requested ? "停止中" : "运行中"}` : data.job.returncode === 0 ? "空闲，上次成功" : data.job.returncode ? "空闲，上次失败" : "空闲";
       logEl.textContent = data.job.log.join("\n");
       logEl.scrollTop = logEl.scrollHeight;
       updateSelectionButtons();
@@ -1096,6 +1152,17 @@ INDEX_HTML = r"""<!doctype html>
       const response = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload || {})});
       if (!response.ok) alert(await response.text());
       await refreshPageData({files: true, review: false});
+    }
+    async function stopJob() {
+      if (!currentRunning) return;
+      if (!confirm("停止当前任务？")) return;
+      const response = await fetch("/api/stop-job", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(data.message || "停止失败");
+        return;
+      }
+      await refreshPageData({files: false, review: false});
     }
     function scheduleReviewSave(delay = 800) {
       if (reviewSaveTimer) clearTimeout(reviewSaveTimer);
@@ -1344,7 +1411,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "message": f"{JOB.name} is already running"}, 409)
                     return
             clear_review_outputs()
-            command = [sys.executable, str(ROOT / "scripts" / "build_review.py"), "--files", *files]
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "build_review.py"),
+                "--files",
+                *files,
+            ]
             ok, message = start_job("生成审核表", command)
             self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
             return
@@ -1367,6 +1439,10 @@ class Handler(BaseHTTPRequestHandler):
                 f"{padding:.3f}",
             ]
             ok, message = start_job("裁剪视频", command)
+            self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            return
+        if parsed.path == "/api/stop-job":
+            ok, message = stop_job()
             self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
             return
         if parsed.path == "/api/promote-template":
