@@ -4,10 +4,28 @@ from pathlib import Path
 
 import numpy as np
 
-from .features import cosine_window_scores
+from .features import cosine_window_scores, resample_feature_sequence
 from .matching import merge_candidates, overlaps
 from .models import Keypoint, Template
 from .time_utils import parse_time, safe_time_name
+
+
+def sample_step_from_times(times: np.ndarray) -> float:
+    return float(np.median(np.diff(times))) if len(times) > 1 else 1.0
+
+def sample_rate_from_times(times: np.ndarray) -> float:
+    step = sample_step_from_times(times)
+    return 1.0 / step if step > 0 else 1.0
+
+def template_sample_rate(item: dict) -> float:
+    sample_rate = item.get("sample_rate")
+    if sample_rate not in (None, ""):
+        return float(sample_rate)
+    duration = float(item.get("duration") or 0)
+    features = item.get("features")
+    if duration > 0 and features is not None and len(features) > 0:
+        return len(features) / duration
+    return 1.0
 
 
 def detect_from_templates(
@@ -19,7 +37,7 @@ def detect_from_templates(
     duration: float,
 ) -> list[dict]:
     candidates: list[dict] = []
-    sample_step = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
+    sample_step = sample_step_from_times(times)
     confirmed_ranges: list[tuple[float, float]] = []
 
     for keypoint in keypoints:
@@ -82,6 +100,7 @@ def build_templates_from_keypoints(
     duration: float,
 ) -> list[dict]:
     templates: list[dict] = []
+    sample_rate = sample_rate_from_times(times)
     for keypoint in keypoints:
         end = keypoint.end if keypoint.end is not None else duration
         if end <= keypoint.start:
@@ -95,6 +114,7 @@ def build_templates_from_keypoints(
                 "features": template,
                 "duration": end - keypoint.start,
                 "source": keypoint.raw,
+                "sample_rate": sample_rate,
             }
         )
     return templates
@@ -110,6 +130,7 @@ def save_templates(template_dir: Path, video_path: Path, templates: list[dict]) 
             path,
             features=item["features"],
             duration=np.asarray([item["duration"]], dtype=np.float32),
+            sample_rate=np.asarray([template_sample_rate(item)], dtype=np.float32),
             source=np.asarray([item["source"]]),
             video=np.asarray([video_path.name]),
         )
@@ -124,6 +145,7 @@ def load_templates(template_dir: Path) -> list[dict]:
             {
                 "features": data["features"],
                 "duration": float(data["duration"][0]),
+                "sample_rate": float(data["sample_rate"][0]) if "sample_rate" in data else None,
                 "source": str(data["source"][0]),
                 "path": str(path),
             }
@@ -138,8 +160,11 @@ def detect_from_template_library(
     min_gap: float,
 ) -> list[dict]:
     candidates: list[dict] = []
+    sample_step = sample_step_from_times(times)
     for template_item in templates:
-        template = template_item["features"]
+        template_duration = float(template_item["duration"])
+        target_length = max(3, int(round(template_duration / sample_step)))
+        template = resample_feature_sequence(template_item["features"], target_length)
         scores = cosine_window_scores(features, template)
         if len(scores) == 0:
             continue
@@ -150,7 +175,7 @@ def detect_from_template_library(
             if score < threshold:
                 break
             start = float(times[score_index])
-            end = start + float(template_item["duration"])
+            end = start + template_duration
             if any(abs(start - old_start) < min_gap for old_start, _, _ in picked):
                 continue
             picked.append((start, end, score))

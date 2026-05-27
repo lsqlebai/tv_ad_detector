@@ -50,7 +50,7 @@ def main() -> int:
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--template-dir", type=Path, default=Path("ad_templates"))
-    parser.add_argument("--sample-rate", type=float, default=2.0)
+    parser.add_argument("--sample-rate", type=float, default=1.0)
     args = parser.parse_args()
 
     start = detect_ads.parse_time(args.start)
@@ -68,6 +68,7 @@ def main() -> int:
         path,
         features=features,
         duration=np.asarray([end - start], dtype=np.float32),
+        sample_rate=np.asarray([args.sample_rate], dtype=np.float32),
         source=np.asarray([source]),
         video=np.asarray([args.video.name]),
     )

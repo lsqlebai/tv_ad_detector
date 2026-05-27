@@ -68,6 +68,22 @@ def cosine_window_scores(features: np.ndarray, template: np.ndarray) -> np.ndarr
         scores[index] = float(np.mean(np.sum(features[index : index + window] * template, axis=1)))
     return scores
 
+def resample_feature_sequence(features: np.ndarray, target_length: int) -> np.ndarray:
+    if target_length <= 0 or len(features) == 0:
+        return np.asarray([], dtype=np.float32)
+    if target_length == len(features):
+        return features
+    if len(features) == 1:
+        return np.repeat(features, target_length, axis=0)
+
+    source_x = np.linspace(0.0, 1.0, len(features), dtype=np.float32)
+    target_x = np.linspace(0.0, 1.0, target_length, dtype=np.float32)
+    resampled = np.vstack(
+        [np.interp(target_x, source_x, features[:, column]) for column in range(features.shape[1])]
+    ).T.astype(np.float32)
+    norms = np.linalg.norm(resampled, axis=1, keepdims=True)
+    return resampled / (norms + 1e-8)
+
 def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 

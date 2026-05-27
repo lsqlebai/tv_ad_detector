@@ -39,9 +39,6 @@ def combine_detections(detections: list[dict], merge_gap: float) -> list[dict]:
             if item_priority < existing_priority:
                 existing.update(item)
             elif item_priority > existing_priority:
-                if existing["kind"] in {"template_match", "template_library"} and item["kind"] == "auto_discovery":
-                    existing["start"] = min(float(existing["start"]), start)
-                    existing["end"] = max(float(existing["end"]), end)
                 existing["score"] = max(float(existing["score"]), float(item["score"]))
                 existing["sources"] = sorted(set(existing["sources"]) | set(item["sources"]))
             else:

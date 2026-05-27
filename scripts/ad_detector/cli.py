@@ -14,7 +14,13 @@ def main() -> int:
     parser.add_argument("--keypoints", type=Path, default=Path("keypoint.txt"))
     parser.add_argument("--ignore-keypoints", action="store_true", help="Ignore keypoint file and rely on template/auto discovery.")
     parser.add_argument("--template-dir", type=Path, default=Path("ad_templates"), help="Directory used to save/load confirmed ad templates.")
-    parser.add_argument("--sample-rate", type=float, default=2.0, help="Frames per second to sample.")
+    parser.add_argument("--sample-rate", type=float, default=1.0, help="Frames per second to sample.")
+    parser.add_argument(
+        "--sample-skip-frame",
+        choices=("none", "noref", "nokey"),
+        default="noref",
+        help="FFmpeg frame skipping used during low-rate sampling. Use none for full decode, noref to skip non-reference frames, or nokey for keyframes only.",
+    )
     parser.add_argument("--threshold", type=float, default=0.94, help="Template similarity threshold.")
     parser.add_argument("--auto-threshold", type=float, default=0.80, help="Minimum score for automatic ad candidates.")
     parser.add_argument("--max-auto-candidates", type=int, default=8, help="Maximum automatic candidates per video.")
@@ -45,6 +51,7 @@ def main() -> int:
         template_dir=args.template_dir,
         ignore_keypoints=args.ignore_keypoints,
         sample_rate=args.sample_rate,
+        sample_skip_frame=args.sample_skip_frame,
         threshold=args.threshold,
         auto_threshold=args.auto_threshold,
         max_auto_candidates=args.max_auto_candidates,

@@ -28,7 +28,8 @@ class DetectionConfig:
     keypoints: Path
     template_dir: Path
     ignore_keypoints: bool = False
-    sample_rate: float = 2.0
+    sample_rate: float = 1.0
+    sample_skip_frame: str = "noref"
     threshold: float = 0.94
     auto_threshold: float = 0.80
     max_auto_candidates: int = 8
@@ -53,9 +54,9 @@ class AdDetectionPipeline:
             keypoints = self.keypoints()
 
         video_started = time.perf_counter()
-        print(f"Sampling {video_path.name}...")
+        print(f"Sampling {video_path.name} at {config.sample_rate:g} fps (skip_frame={config.sample_skip_frame})...")
         stage_started = time.perf_counter()
-        times, features, metrics, duration = sample_video(video_path, config.sample_rate)
+        times, features, metrics, duration = sample_video(video_path, config.sample_rate, config.sample_skip_frame)
         print(f"  sampled {len(times)} frames in {time.perf_counter() - stage_started:.1f}s")
 
         keypoint_templates = build_templates_from_keypoints(times, features, keypoints, duration)
@@ -94,7 +95,13 @@ class AdDetectionPipeline:
         detections = combine_detections(detections, merge_gap=config.min_gap)
         if not config.no_refine_boundaries:
             stage_started = time.perf_counter()
-            detections = BoundaryRefiner(config.output_dir, config.write_debug_files).refine(video_path, detections, duration)
+            detections = BoundaryRefiner(config.output_dir, config.write_debug_files).refine(
+                video_path,
+                detections,
+                duration,
+                sample_times=times,
+                sample_metrics=metrics,
+            )
             print(f"  refined boundaries in {time.perf_counter() - stage_started:.1f}s")
 
         stage_started = time.perf_counter()

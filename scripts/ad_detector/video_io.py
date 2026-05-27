@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -40,10 +41,12 @@ def read_scaled_frame(video_path: Path, time_value: float) -> Optional[np.ndarra
     rgb = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-def sample_video(video_path: Path, sample_rate: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def sample_video(video_path: Path, sample_rate: float, skip_frame: str = "noref") -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    input_params = [] if skip_frame == "none" else ["-skip_frame", skip_frame]
     reader = imageio_ffmpeg.read_frames(
         str(video_path),
         pix_fmt="rgb24",
+        input_params=input_params,
         output_params=["-vf", f"fps={sample_rate},scale=320:-2"],
     )
     try:
@@ -81,8 +84,25 @@ def boundary_frames(
     end = max(start, min(duration, end))
     if end - start < 1.0 / sample_rate:
         return []
+    return list(
+        _boundary_frames_cached(
+            str(video_path),
+            round(start, 3),
+            round(end, 3),
+            round(sample_rate, 3),
+        )
+    )
+
+
+@lru_cache(maxsize=512)
+def _boundary_frames_cached(
+    video_path_text: str,
+    start: float,
+    end: float,
+    sample_rate: float,
+) -> tuple[tuple[float, float, float, float], ...]:
     reader = imageio_ffmpeg.read_frames(
-        str(video_path),
+        video_path_text,
         pix_fmt="rgb24",
         input_params=["-ss", f"{start:.3f}"],
         output_params=["-t", f"{end - start:.3f}", "-vf", f"fps={sample_rate},scale=320:-2"],
@@ -106,7 +126,7 @@ def boundary_frames(
             diff = float(np.mean(cv2.absdiff(gray, previous_gray)) / 255.0)
         rows.append((time_value, brightness, dark_ratio, diff))
         previous_gray = gray
-    return rows
+    return tuple(rows)
 
 def extract_raw_snapshots(
     ffmpeg: str,
