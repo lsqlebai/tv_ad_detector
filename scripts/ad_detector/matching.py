@@ -42,9 +42,18 @@ def combine_detections(detections: list[dict], merge_gap: float) -> list[dict]:
                 existing["score"] = max(float(existing["score"]), float(item["score"]))
                 existing["sources"] = sorted(set(existing["sources"]) | set(item["sources"]))
             else:
-                existing["start"] = min(float(existing["start"]), start)
-                existing["end"] = max(float(existing["end"]), end)
-                existing["score"] = max(float(existing["score"]), float(item["score"]))
+                if item["kind"] in {"template_match", "template_library"}:
+                    # Overlapping template windows are competing estimates of
+                    # the same occurrence. Preserve the better window instead
+                    # of expanding its boundaries to the union of both.
+                    if float(item["score"]) > float(existing["score"]):
+                        old_sources = existing["sources"]
+                        existing.update(item)
+                        existing["sources"] = sorted(set(old_sources) | set(item["sources"]))
+                else:
+                    existing["start"] = min(float(existing["start"]), start)
+                    existing["end"] = max(float(existing["end"]), end)
+                    existing["score"] = max(float(existing["score"]), float(item["score"]))
                 existing["sources"] = sorted(set(existing["sources"]) | set(item["sources"]))
             merged = True
             break

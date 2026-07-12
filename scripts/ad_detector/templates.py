@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -139,18 +140,58 @@ def load_templates(template_dir: Path) -> list[dict]:
     if not template_dir.exists():
         return []
     templates: list[dict] = []
+    seen: set[str] = set()
     for path in sorted(template_dir.glob("*.npz")):
         data = np.load(path)
+        features = data["features"]
+        duration = float(data["duration"][0])
+        source = str(data["source"][0])
+        fingerprint = hashlib.sha256()
+        fingerprint.update(features.tobytes())
+        fingerprint.update(f"{duration:.6f}\0{source}".encode("utf-8"))
+        digest = fingerprint.hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
         templates.append(
             {
-                "features": data["features"],
-                "duration": float(data["duration"][0]),
+                "features": features,
+                "duration": duration,
                 "sample_rate": float(data["sample_rate"][0]) if "sample_rate" in data else None,
-                "source": str(data["source"][0]),
+                "source": source,
                 "path": str(path),
             }
         )
     return templates
+
+
+def template_match_edge_debug(
+    features: np.ndarray,
+    template: np.ndarray,
+    score_index: int,
+    edge_samples: int = 3,
+) -> dict[str, float | None]:
+    """Measure whether similarity drops immediately outside a template window."""
+    count = min(edge_samples, len(template))
+    window_end = score_index + len(template)
+    start_inside = float(np.mean(np.sum(features[score_index : score_index + count] * template[:count], axis=1)))
+    end_inside = float(np.mean(np.sum(features[window_end - count : window_end] * template[-count:], axis=1)))
+
+    start_outside = None
+    if score_index >= count:
+        start_outside = float(np.mean(np.sum(features[score_index - count : score_index] * template[:count], axis=1)))
+    end_outside = None
+    if window_end + count <= len(features):
+        end_outside = float(np.mean(np.sum(features[window_end : window_end + count] * template[-count:], axis=1)))
+
+    return {
+        "template_start_inside_similarity": round(start_inside, 4),
+        "template_start_outside_similarity": round(start_outside, 4) if start_outside is not None else None,
+        "template_start_contrast": round(start_inside - start_outside, 4) if start_outside is not None else None,
+        "template_end_inside_similarity": round(end_inside, 4),
+        "template_end_outside_similarity": round(end_outside, 4) if end_outside is not None else None,
+        "template_end_contrast": round(end_inside - end_outside, 4) if end_outside is not None else None,
+    }
 
 def detect_from_template_library(
     times: np.ndarray,
@@ -176,7 +217,10 @@ def detect_from_template_library(
                 break
             start = float(times[score_index])
             end = start + template_duration
-            if any(abs(start - old_start) < min_gap for old_start, _, _ in picked):
+            # Sliding windows for one ad commonly stay above the threshold for
+            # several neighbouring offsets. They describe one occurrence, not
+            # a longer ad. Keep the highest peak instead of unioning the windows.
+            if any(overlaps(start, end, old_start, old_end) for old_start, old_end, _ in picked):
                 continue
             picked.append((start, end, score))
             candidates.append(
@@ -186,9 +230,10 @@ def detect_from_template_library(
                     "score": score,
                     "sources": [f"template={template_item['source']}"],
                     "kind": "template_library",
+                    "boundary_debug": template_match_edge_debug(features, template, int(score_index)),
                 }
             )
-    return merge_candidates(candidates, merge_gap=min_gap)
+    return candidates
 
 
 class TemplateStore:

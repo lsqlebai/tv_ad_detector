@@ -69,6 +69,32 @@ def any_dark_transition_end(
     return max(dark_times)
 
 
+def dark_transition_bounds(
+    rows: list[tuple[float, float, float, float]],
+    center: float,
+    sample_rate: float,
+    radius: float = 1.0,
+) -> Optional[tuple[float, float]]:
+    """Return the frames immediately before and after a nearby dark run."""
+    frame_step = 1.0 / sample_rate
+    dark_times = [
+        time_value
+        for time_value, brightness, dark_ratio, _ in rows
+        if abs(time_value - center) <= radius and brightness < 0.16 and dark_ratio > 0.65
+    ]
+    if not dark_times:
+        return None
+
+    runs: list[list[float]] = []
+    for time_value in sorted(dark_times):
+        if not runs or time_value - runs[-1][-1] > 1.5 * frame_step:
+            runs.append([time_value])
+        else:
+            runs[-1].append(time_value)
+    run = min(runs, key=lambda values: min(abs(center - values[0]), abs(center - values[-1])))
+    return max(0.0, run[0] - frame_step), run[-1] + frame_step
+
+
 def trailing_cut_time(
     rows: list[tuple[float, float, float, float]],
     center: float,

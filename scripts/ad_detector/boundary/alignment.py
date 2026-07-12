@@ -17,7 +17,7 @@ from .config import (
     boundary_refine_settings,
     expanded_boundary_refine_settings,
 )
-from .cuts import any_dark_transition_end, dark_transition_end, leading_cut_time, strong_cut_candidates, strongest_cut_time, strongest_cut_time_between, trailing_cut_time
+from .cuts import any_dark_transition_end, dark_transition_bounds, dark_transition_end, leading_cut_time, strong_cut_candidates, strongest_cut_time, strongest_cut_time_between, trailing_cut_time
 from .scoring import cut_confidence
 
 
@@ -387,6 +387,13 @@ def refine_edge_candidate(
     resolution = resolve_ad_edge(video_path, best_cut_time, sample_rate, side)
     if resolution is None:
         return None
+    if side == "end":
+        dark_bounds = dark_transition_bounds(rows, best_cut_time, sample_rate)
+        if dark_bounds is not None:
+            # Keep the dark transition in the removed interval, but expose the
+            # final visible ad frame as `end` and the first content frame as
+            # `end_after` for review.
+            resolution = EdgeResolution(ad_frame=dark_bounds[0], content_frame=dark_bounds[1])
     resolution = EdgeResolution(
         ad_frame=refined_time_from_ad_frame(side, resolution.ad_frame, sample_rate, duration),
         content_frame=min(duration, resolution.content_frame) if resolution.content_frame is not None else None,
@@ -473,9 +480,22 @@ def refine_detection_boundaries(
         end_semantic_scores = refined_end_candidate.semantic_scores if refined_end_candidate is not None else None
 
         expanded_settings = expanded_boundary_refine_settings()
-        start_expanded_attempt = start_score < BOUNDARY_CONFIDENCE_THRESHOLD
+        match_debug = item.get("boundary_debug") if isinstance(item.get("boundary_debug"), dict) else {}
+        start_template_contrast = match_debug.get("template_start_contrast")
+        end_template_contrast = match_debug.get("template_end_contrast")
+        start_has_template_edge = (
+            item["kind"] == "template_library"
+            and start_template_contrast is not None
+            and float(start_template_contrast) >= 0.08
+        )
+        end_has_template_edge = (
+            item["kind"] == "template_library"
+            and end_template_contrast is not None
+            and float(end_template_contrast) >= 0.08
+        )
+        start_expanded_attempt = start_score < BOUNDARY_CONFIDENCE_THRESHOLD and not start_has_template_edge
         start_expanded_used = False
-        end_expanded_attempt = end_score < BOUNDARY_CONFIDENCE_THRESHOLD
+        end_expanded_attempt = end_score < BOUNDARY_CONFIDENCE_THRESHOLD and not end_has_template_edge
         end_expanded_used = False
         if start_expanded_attempt:
             expanded_start_rows = boundary_frames(
@@ -564,6 +584,8 @@ def refine_detection_boundaries(
                 "end_expanded_used": end_expanded_used,
                 "start_seconds_before": round(start, 3),
                 "end_seconds_before": round(end, 3),
+                "start_template_edge_supported": start_has_template_edge,
+                "end_template_edge_supported": end_has_template_edge,
             }
         )
         add_edge_semantic_debug(debug, "start", start_semantic_scores)

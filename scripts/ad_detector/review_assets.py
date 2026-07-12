@@ -182,7 +182,16 @@ def write_outputs(
         for index, item in enumerate(detections, start=1):
             item_snapshots = snapshots.get(index, {})
             boundary_review_notes = boundary_notes.get(index, [])
-            review_required = (item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD) or bool(boundary_review_notes)
+            debug = item.get("boundary_debug") if isinstance(item.get("boundary_debug"), dict) else {}
+            template_boundary_uncertain = item["kind"] == "template_library" and (
+                not debug.get("start_template_edge_supported")
+                or not debug.get("end_template_edge_supported")
+            )
+            review_required = (
+                (item["kind"] == "auto_discovery" and float(item["score"]) < AUTO_TRUST_THRESHOLD)
+                or template_boundary_uncertain
+                or bool(boundary_review_notes)
+            )
             sources = sorted(set(item["sources"]) | set(boundary_review_notes))
             end_after = float(item.get("end_after") or item["end"])
             writer.writerow(
